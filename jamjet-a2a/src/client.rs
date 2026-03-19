@@ -124,11 +124,9 @@ impl A2aClient {
             .json(&rpc_request)
             .send()
             .await
-            .map_err(|e| {
-                A2aTransportError::Connection {
-                    url: url.clone(),
-                    source: Box::new(e),
-                }
+            .map_err(|e| A2aTransportError::Connection {
+                url: url.clone(),
+                source: Box::new(e),
             })?;
 
         let status = response.status();
@@ -138,11 +136,12 @@ impl A2aClient {
             });
         }
 
-        let body = response.text().await.map_err(|e| {
-            A2aTransportError::InvalidResponse {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| A2aTransportError::InvalidResponse {
                 details: format!("failed to read response body: {e}"),
-            }
-        })?;
+            })?;
 
         let rpc_response: JsonRpcResponse<R> =
             serde_json::from_str(&body).map_err(|e| A2aTransportError::InvalidResponse {
@@ -153,14 +152,12 @@ impl A2aClient {
             return Err(Self::protocol_error_from_json_rpc(err).into());
         }
 
-        rpc_response
-            .result
-            .ok_or_else(|| {
-                A2aTransportError::InvalidResponse {
-                    details: "JSON-RPC response has neither result nor error".into(),
-                }
-                .into()
-            })
+        rpc_response.result.ok_or_else(|| {
+            A2aTransportError::InvalidResponse {
+                details: "JSON-RPC response has neither result nor error".into(),
+            }
+            .into()
+        })
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -269,11 +266,7 @@ impl A2aClient {
     }
 
     /// Retrieve a task by ID.
-    pub async fn get_task(
-        &self,
-        base_url: &str,
-        req: GetTaskRequest,
-    ) -> Result<Task, A2aError> {
+    pub async fn get_task(&self, base_url: &str, req: GetTaskRequest) -> Result<Task, A2aError> {
         self.rpc_call(base_url, "GetTask", req).await
     }
 
@@ -403,7 +396,12 @@ impl A2aClient {
         max_duration: Option<Duration>,
     ) -> Result<Task, A2aError> {
         let start = tokio::time::Instant::now();
-        info!(task_id, ?interval, ?max_duration, "waiting for task completion");
+        info!(
+            task_id,
+            ?interval,
+            ?max_duration,
+            "waiting for task completion"
+        );
 
         loop {
             let task = self
@@ -564,7 +562,10 @@ mod tests {
             data: None,
         };
         let proto = A2aClient::protocol_error_from_json_rpc(&err);
-        assert!(matches!(proto, A2aProtocolError::PushNotificationNotSupported));
+        assert!(matches!(
+            proto,
+            A2aProtocolError::PushNotificationNotSupported
+        ));
     }
 
     #[test]
@@ -614,6 +615,9 @@ mod tests {
             data: None,
         };
         let proto = A2aClient::protocol_error_from_json_rpc(&err);
-        assert!(matches!(proto, A2aProtocolError::InvalidAgentResponse { .. }));
+        assert!(matches!(
+            proto,
+            A2aProtocolError::InvalidAgentResponse { .. }
+        ));
     }
 }

@@ -148,12 +148,12 @@ impl A2aServer {
         let addr = format!("0.0.0.0:{port}");
         info!(addr = %addr, "starting A2A server");
 
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| A2aTransportError::Connection {
+        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+            A2aTransportError::Connection {
                 url: addr.clone(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         axum::serve(listener, router)
             .await
@@ -205,17 +205,12 @@ async fn jsonrpc_handler(
         "CreateTaskPushNotificationConfig"
         | "GetTaskPushNotificationConfig"
         | "ListTaskPushNotificationConfigs"
-        | "DeleteTaskPushNotificationConfig" => {
-            make_error_response(
-                rpc.id,
-                A2aProtocolError::UnsupportedOperation {
-                    method: rpc.method,
-                },
-            )
-            .into_response()
-        }
-        _ => make_json_rpc_error_response(rpc.id, -32601, "Method not found", None)
-            .into_response(),
+        | "DeleteTaskPushNotificationConfig" => make_error_response(
+            rpc.id,
+            A2aProtocolError::UnsupportedOperation { method: rpc.method },
+        )
+        .into_response(),
+        _ => make_json_rpc_error_response(rpc.id, -32601, "Method not found", None).into_response(),
     }
 }
 
@@ -223,10 +218,7 @@ async fn jsonrpc_handler(
 // Individual method handlers
 // ────────────────────────────────────────────────────────────────────────────
 
-async fn handle_send_message(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_send_message(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: SendMessageRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -318,10 +310,7 @@ async fn handle_send_message(
     make_success_response(rpc.id, &resp_task).into_response()
 }
 
-async fn handle_get_task(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_get_task(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: GetTaskRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -337,19 +326,13 @@ async fn handle_get_task(
 
     match state.store.get(&req.id).await {
         Ok(Some(task)) => make_success_response(rpc.id, &task).into_response(),
-        Ok(None) => make_error_response(
-            rpc.id,
-            A2aProtocolError::TaskNotFound { task_id: req.id },
-        )
-        .into_response(),
+        Ok(None) => make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id: req.id })
+            .into_response(),
         Err(e) => make_error_response(rpc.id, e).into_response(),
     }
 }
 
-async fn handle_list_tasks(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_list_tasks(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: ListTasksRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -369,10 +352,7 @@ async fn handle_list_tasks(
     }
 }
 
-async fn handle_cancel_task(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_cancel_task(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: CancelTaskRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -392,11 +372,8 @@ async fn handle_cancel_task(
             // Return the updated task.
             match state.store.get(&task_id).await {
                 Ok(Some(task)) => make_success_response(rpc.id, &task).into_response(),
-                Ok(None) => make_error_response(
-                    rpc.id,
-                    A2aProtocolError::TaskNotFound { task_id },
-                )
-                .into_response(),
+                Ok(None) => make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id })
+                    .into_response(),
                 Err(e) => make_error_response(rpc.id, e).into_response(),
             }
         }
@@ -404,10 +381,7 @@ async fn handle_cancel_task(
     }
 }
 
-async fn handle_send_streaming(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_send_streaming(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: SendMessageRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -497,20 +471,12 @@ async fn handle_send_streaming(
 
     match rx {
         Some(rx) => make_sse_stream(rx).into_response(),
-        None => make_json_rpc_error_response(
-            rpc.id,
-            -32603,
-            "Failed to create event stream",
-            None,
-        )
-        .into_response(),
+        None => make_json_rpc_error_response(rpc.id, -32603, "Failed to create event stream", None)
+            .into_response(),
     }
 }
 
-async fn handle_subscribe(
-    state: ServerState,
-    rpc: IncomingRpc,
-) -> axum::response::Response {
+async fn handle_subscribe(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
     let req: SubscribeToTaskRequest = match serde_json::from_value(rpc.params) {
         Ok(r) => r,
         Err(e) => {
@@ -527,13 +493,8 @@ async fn handle_subscribe(
     // Verify the task exists.
     match state.store.get(&req.id).await {
         Ok(None) => {
-            return make_error_response(
-                rpc.id,
-                A2aProtocolError::TaskNotFound {
-                    task_id: req.id,
-                },
-            )
-            .into_response();
+            return make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id: req.id })
+                .into_response();
         }
         Err(e) => return make_error_response(rpc.id, e).into_response(),
         Ok(Some(_)) => {}
@@ -541,13 +502,10 @@ async fn handle_subscribe(
 
     match state.store.subscribe(&req.id).await {
         Some(rx) => make_sse_stream(rx).into_response(),
-        None => make_json_rpc_error_response(
-            rpc.id,
-            -32603,
-            "Failed to subscribe to task events",
-            None,
-        )
-        .into_response(),
+        None => {
+            make_json_rpc_error_response(rpc.id, -32603, "Failed to subscribe to task events", None)
+                .into_response()
+        }
     }
 }
 

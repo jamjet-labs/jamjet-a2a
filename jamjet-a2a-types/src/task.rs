@@ -121,8 +121,7 @@ impl<'de> Deserialize<'de> for PartContent {
         D: serde::Deserializer<'de>,
     {
         // Deserialize into a generic map first, then inspect keys.
-        let map: HashMap<String, Value> =
-            HashMap::deserialize(deserializer)?;
+        let map: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
 
         if let Some(v) = map.get("text") {
             let s = v

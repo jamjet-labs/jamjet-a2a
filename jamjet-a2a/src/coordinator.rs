@@ -329,10 +329,7 @@ pub async fn select_agent(
     let rejected: Vec<RejectedAgent> = sorted
         .into_iter()
         .map(|s| {
-            let reason = format!(
-                "score {:.3} < best {:.3}",
-                s.total_score, best.total_score
-            );
+            let reason = format!("score {:.3} < best {:.3}", s.total_score, best.total_score);
             RejectedAgent {
                 card: s.card.clone(),
                 score: s,

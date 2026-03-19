@@ -35,10 +35,7 @@ pub trait TaskStore: Send + Sync {
 
     /// Subscribe to streaming events for a task. Returns `None` if the task
     /// does not exist or has no broadcast channel.
-    async fn subscribe(
-        &self,
-        task_id: &str,
-    ) -> Option<broadcast::Receiver<StreamResponse>>;
+    async fn subscribe(&self, task_id: &str) -> Option<broadcast::Receiver<StreamResponse>>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -103,11 +100,12 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), A2aError> {
         let mut inner = self.inner.lock().await;
-        let task = inner.tasks.get_mut(task_id).ok_or_else(|| {
-            A2aProtocolError::TaskNotFound {
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| A2aProtocolError::TaskNotFound {
                 task_id: task_id.to_string(),
-            }
-        })?;
+            })?;
         task.status = status.clone();
         let context_id = task.context_id.clone().unwrap_or_default();
         // Release the mutable borrow on `tasks` before accessing `channels`.
@@ -131,11 +129,12 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn add_artifact(&self, task_id: &str, artifact: Artifact) -> Result<(), A2aError> {
         let mut inner = self.inner.lock().await;
-        let task = inner.tasks.get_mut(task_id).ok_or_else(|| {
-            A2aProtocolError::TaskNotFound {
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| A2aProtocolError::TaskNotFound {
                 task_id: task_id.to_string(),
-            }
-        })?;
+            })?;
         task.artifacts.push(artifact.clone());
         let context_id = task.context_id.clone().unwrap_or_default();
         // Release the mutable borrow on `tasks` before accessing `channels`.
@@ -218,11 +217,12 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn cancel(&self, task_id: &str) -> Result<(), A2aError> {
         let mut inner = self.inner.lock().await;
-        let task = inner.tasks.get_mut(task_id).ok_or_else(|| {
-            A2aProtocolError::TaskNotFound {
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| A2aProtocolError::TaskNotFound {
                 task_id: task_id.to_string(),
-            }
-        })?;
+            })?;
 
         // Terminal states cannot be canceled.
         match task.status.state {
@@ -260,10 +260,7 @@ impl TaskStore for InMemoryTaskStore {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        task_id: &str,
-    ) -> Option<broadcast::Receiver<StreamResponse>> {
+    async fn subscribe(&self, task_id: &str) -> Option<broadcast::Receiver<StreamResponse>> {
         let inner = self.inner.lock().await;
         inner.channels.get(task_id).map(|tx| tx.subscribe())
     }

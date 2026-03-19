@@ -87,9 +87,7 @@ fn test_agent_card() -> AgentCard {
 /// Start the server on a random port and return the base URL.
 async fn start_server() -> String {
     let card = test_agent_card();
-    let router = A2aServer::new(card)
-        .with_handler(EchoHandler)
-        .into_router();
+    let router = A2aServer::new(card).with_handler(EchoHandler).into_router();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -221,7 +219,10 @@ async fn full_lifecycle() {
     );
     let err = cancel_result.unwrap_err();
     assert!(
-        matches!(err, A2aError::Protocol(A2aProtocolError::TaskNotCancelable { .. })),
+        matches!(
+            err,
+            A2aError::Protocol(A2aProtocolError::TaskNotCancelable { .. })
+        ),
         "expected TaskNotCancelable, got: {err:?}"
     );
 }
@@ -245,7 +246,10 @@ async fn get_nonexistent_task_returns_error() {
     assert!(result.is_err(), "fetching a nonexistent task should fail");
     let err = result.unwrap_err();
     assert!(
-        matches!(err, A2aError::Protocol(A2aProtocolError::TaskNotFound { .. })),
+        matches!(
+            err,
+            A2aError::Protocol(A2aProtocolError::TaskNotFound { .. })
+        ),
         "expected TaskNotFound, got: {err:?}"
     );
 }
