@@ -13,7 +13,7 @@ categories = ["network-programming", "web-programming"]
 default = ["client", "server"]
 client = ["dep:reqwest", "dep:futures"]
 server = ["dep:axum", "dep:tokio-stream", "dep:chrono", "dep:uuid"]
-federation = ["server"]
+federation = ["server", "dep:reqwest"]
 coordinator = ["client"]
 mcp-bridge = []
 

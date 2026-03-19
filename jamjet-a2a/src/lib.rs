@@ -15,3 +15,6 @@ pub mod server;
 pub use store::{TaskStore, InMemoryTaskStore};
 #[cfg(feature = "server")]
 pub use server::{A2aServer, TaskHandler};
+
+#[cfg(feature = "federation")]
+pub mod federation;
