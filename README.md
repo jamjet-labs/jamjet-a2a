@@ -146,6 +146,18 @@ async fn main() -> Result<(), A2aError> {
 }
 ```
 
+## A2A TCK Conformance
+
+Tested against the official [A2A Technology Compatibility Kit](https://github.com/a2aproject/a2a-tck) (mandatory category):
+
+| Category | Passed | Failed | Skipped |
+|----------|--------|--------|---------|
+| Mandatory | 75 | 1* | 40 |
+
+\* The single failure is a [bug in the TCK itself](https://github.com/a2aproject/a2a-tck), not in this SDK.
+
+The server accepts both v1.0 method names (`SendMessage`, `GetTask`) and v0.3 aliases (`message/send`, `tasks/get`) for backward compatibility.
+
 ## Two Crates
 
 This workspace ships two crates:
