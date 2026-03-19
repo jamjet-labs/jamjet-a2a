@@ -18,3 +18,6 @@ pub use server::{A2aServer, TaskHandler};
 
 #[cfg(feature = "federation")]
 pub mod federation;
+
+#[cfg(feature = "coordinator")]
+pub mod coordinator;
