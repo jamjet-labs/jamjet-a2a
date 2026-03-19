@@ -38,3 +38,5 @@ uuid = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true }
 axum = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
