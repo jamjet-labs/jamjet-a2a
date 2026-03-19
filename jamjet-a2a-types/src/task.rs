@@ -29,14 +29,14 @@ pub enum TaskState {
 impl Serialize for TaskState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let s = match self {
-            TaskState::Submitted => "SUBMITTED",
-            TaskState::Working => "WORKING",
-            TaskState::Completed => "COMPLETED",
-            TaskState::Failed => "FAILED",
-            TaskState::Canceled => "CANCELED",
-            TaskState::InputRequired => "INPUT_REQUIRED",
-            TaskState::Rejected => "REJECTED",
-            TaskState::AuthRequired => "AUTH_REQUIRED",
+            TaskState::Submitted => "TASK_STATE_SUBMITTED",
+            TaskState::Working => "TASK_STATE_WORKING",
+            TaskState::Completed => "TASK_STATE_COMPLETED",
+            TaskState::Failed => "TASK_STATE_FAILED",
+            TaskState::Canceled => "TASK_STATE_CANCELED",
+            TaskState::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+            TaskState::Rejected => "TASK_STATE_REJECTED",
+            TaskState::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
         };
         serializer.serialize_str(s)
     }
@@ -98,8 +98,8 @@ pub enum Role {
 impl Serialize for Role {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Role::User => serializer.serialize_str("user"),
-            Role::Agent => serializer.serialize_str("agent"),
+            Role::User => serializer.serialize_str("ROLE_USER"),
+            Role::Agent => serializer.serialize_str("ROLE_AGENT"),
         }
     }
 }
@@ -264,7 +264,7 @@ pub struct Artifact {
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub context_id: Option<String>,
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -284,15 +284,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_state_serializes_to_screaming_snake_case() {
+    fn task_state_serializes_to_proto_format() {
         let json = serde_json::to_string(&TaskState::InputRequired).unwrap();
-        assert_eq!(json, "\"INPUT_REQUIRED\"");
+        assert_eq!(json, "\"TASK_STATE_INPUT_REQUIRED\"");
+        let json = serde_json::to_string(&TaskState::Submitted).unwrap();
+        assert_eq!(json, "\"TASK_STATE_SUBMITTED\"");
     }
 
     #[test]
-    fn role_serializes_to_lowercase() {
-        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"user\"");
-        assert_eq!(serde_json::to_string(&Role::Agent).unwrap(), "\"agent\"");
+    fn role_serializes_to_proto_format() {
+        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"ROLE_USER\"");
+        assert_eq!(serde_json::to_string(&Role::Agent).unwrap(), "\"ROLE_AGENT\"");
     }
 
     #[test]

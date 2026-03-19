@@ -8,6 +8,9 @@ use jamjet_a2a_types::*;
 use std::sync::Arc;
 
 /// A handler that echoes the first text part back to the caller.
+///
+/// Includes a short delay before completing so that the task stays in the
+/// WORKING state long enough for cancellation / subscribe tests to succeed.
 struct EchoHandler;
 
 #[async_trait::async_trait]
@@ -26,6 +29,10 @@ impl TaskHandler for EchoHandler {
                 _ => None,
             })
             .unwrap_or_else(|| "(no text)".to_string());
+
+        // Short delay to keep the task in WORKING state long enough for
+        // cancellation and subscription tests (TCK compliance).
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         store
             .update_status(

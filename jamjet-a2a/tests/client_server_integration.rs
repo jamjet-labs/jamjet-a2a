@@ -151,10 +151,9 @@ async fn full_lifecycle() {
         .expect("send_message failed");
 
     // Extract the task from the response.
-    let task = match send_resp {
-        SendMessageResponse::Task(t) => t,
-        other => panic!("expected Task response, got: {other:?}"),
-    };
+    let task = send_resp
+        .into_task()
+        .expect("expected Task response from SendMessage");
     let task_id = task.id.clone();
     assert!(!task_id.is_empty());
 
@@ -286,7 +285,7 @@ async fn multiple_tasks_listed_correctly() {
             .send_message(&base_url, send_req)
             .await
             .expect("send_message failed");
-        if let SendMessageResponse::Task(t) = resp {
+        if let Some(t) = resp.into_task() {
             task_ids.push(t.id.clone());
         }
     }

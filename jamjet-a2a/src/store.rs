@@ -159,65 +159,110 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2aError> {
         let inner = self.inner.lock().await;
-        let total_size = inner.order.len() as i32;
 
-        // Find the starting index based on the page_token (cursor).
-        // Invalid tokens yield an empty result set (not an error).
-        let start_idx = if let Some(ref token) = req.page_token {
-            if token.is_empty() {
-                0
-            } else {
-                inner
-                    .order
-                    .iter()
-                    .position(|id| id == token)
-                    .map(|pos| pos + 1) // start after the cursor
-                    .unwrap_or(inner.order.len()) // unknown token → past end → empty
-            }
-        } else {
-            0
-        };
+        let page_size = req.page_size.unwrap_or(50).max(1).min(100) as usize;
+        let history_length = req.history_length;
+        let include_artifacts = req.include_artifacts.unwrap_or(false);
 
-        // Default 50, floor 1, cap 100.
-        let raw_page_size = req.page_size.unwrap_or(50);
-        let page_size = raw_page_size.max(1).min(100) as usize;
+        // Parse statusTimestampAfter filter.
+        let ts_after = req
+            .status_timestamp_after
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
 
-        // Collect matching tasks from insertion order.
-        let mut tasks = Vec::new();
-        let mut last_id = String::new();
-
-        for id in inner.order.iter().skip(start_idx) {
-            if tasks.len() >= page_size {
-                break;
-            }
+        // Step 1: Collect ALL matching tasks (applying filters) in reverse insertion
+        // order (descending — most recently inserted first, per A2A spec).
+        let mut all_matching: Vec<Task> = Vec::new();
+        for id in inner.order.iter().rev() {
             if let Some(task) = inner.tasks.get(id) {
-                // Filter by context_id if specified.
+                // Filter by context_id.
                 if let Some(ref ctx) = req.context_id {
                     if task.context_id.as_deref() != Some(ctx.as_str()) {
                         continue;
                     }
                 }
-                // Filter by status if specified.
+                // Filter by status.
                 if let Some(ref status) = req.status {
                     if task.status.state != *status {
                         continue;
                     }
                 }
-                last_id = id.clone();
-                tasks.push(task.clone());
+                // Filter by statusTimestampAfter.
+                if let Some(ts_cutoff) = &ts_after {
+                    let passes = task
+                        .status
+                        .timestamp
+                        .as_deref()
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t >= *ts_cutoff)
+                        .unwrap_or(false);
+                    if !passes {
+                        continue;
+                    }
+                }
+                all_matching.push(task.clone());
             }
         }
 
-        let next_page_token = if tasks.len() == page_size && !last_id.is_empty() {
-            last_id
+        let total_size = all_matching.len() as i32;
+
+        // Step 2: Cursor-based pagination on the filtered set.
+        let start_idx = if let Some(ref token) = req.page_token {
+            if token.is_empty() {
+                0
+            } else {
+                // Find the cursor in the filtered list and start after it.
+                all_matching
+                    .iter()
+                    .position(|t| t.id == *token)
+                    .map(|pos| pos + 1)
+                    .unwrap_or(all_matching.len())
+            }
+        } else {
+            0
+        };
+
+        let page: Vec<Task> = all_matching
+            .into_iter()
+            .skip(start_idx)
+            .take(page_size)
+            .map(|mut task| {
+                // Apply historyLength limiting.
+                if let Some(hl) = history_length {
+                    if hl == 0 {
+                        task.history = None;
+                    } else if let Some(ref mut hist) = task.history {
+                        let hl = hl as usize;
+                        if hist.len() > hl {
+                            let start = hist.len() - hl;
+                            *hist = hist.split_off(start);
+                        }
+                    }
+                }
+                // Exclude artifacts unless explicitly requested.
+                if !include_artifacts {
+                    task.artifacts = vec![];
+                }
+                task
+            })
+            .collect();
+
+        let actual_count = page.len() as i32;
+
+        // Determine next_page_token: empty string means no more results.
+        let next_page_token = if page.len() == page_size
+            && start_idx + page_size < total_size as usize
+        {
+            page.last().map(|t| t.id.clone()).unwrap_or_default()
         } else {
             String::new()
         };
 
+        // pageSize in response = actual number of tasks returned (capped by request).
         Ok(ListTasksResponse {
-            tasks,
+            tasks: page,
             next_page_token,
-            page_size: page_size as i32,
+            page_size: actual_count,
             total_size,
         })
     }

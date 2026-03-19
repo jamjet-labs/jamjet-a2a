@@ -227,7 +227,24 @@ async fn jsonrpc_handler(
         .into_response();
     }
 
-    // Step 3: Extract method.
+    // Step 3: Validate id field (must be string, number, or null per JSON-RPC 2.0).
+    if let Some(id_val) = body.get("id") {
+        match id_val {
+            serde_json::Value::String(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Null => {} // valid
+            _ => {
+                return Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {"code": -32600, "message": "Invalid Request"}
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    // Step 4: Extract method.
     let method = match body.get("method").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
@@ -241,7 +258,7 @@ async fn jsonrpc_handler(
         }
     };
 
-    // Step 4: Extract id and params.
+    // Step 5: Extract id and params.
     let rpc_id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let params = body.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
@@ -369,7 +386,8 @@ async fn handle_send_message(state: ServerState, rpc: IncomingRpc) -> axum::resp
     // If return_immediately is set, return the task in Submitted state.
     // Otherwise, return the task as-is (the handler runs in background either way).
     let resp_task = state.store.get(&task_id).await.unwrap_or(Some(task));
-    make_success_response(rpc.id, &resp_task).into_response()
+    // A2A v1.0: SendMessage returns {"result": {"task": <Task>}}
+    make_success_response(rpc.id, &serde_json::json!({"task": resp_task})).into_response()
 }
 
 async fn handle_get_task(state: ServerState, rpc: IncomingRpc) -> axum::response::Response {
@@ -407,6 +425,65 @@ async fn handle_list_tasks(state: ServerState, rpc: IncomingRpc) -> axum::respon
             .into_response();
         }
     };
+
+    // Validate page_size: must be 1..=100 if provided.
+    if let Some(ps) = req.page_size {
+        if ps <= 0 || ps > 100 {
+            return make_json_rpc_error_response(
+                rpc.id,
+                -32602,
+                "Invalid params: pageSize must be between 1 and 100",
+                None,
+            )
+            .into_response();
+        }
+    }
+
+    // Validate history_length: must be >= 0 if provided.
+    if let Some(hl) = req.history_length {
+        if hl < 0 {
+            return make_json_rpc_error_response(
+                rpc.id,
+                -32602,
+                "Invalid params: historyLength must be >= 0",
+                None,
+            )
+            .into_response();
+        }
+    }
+
+    // Validate page_token: if provided and non-empty, must correspond to an existing task.
+    if let Some(ref token) = req.page_token {
+        if !token.is_empty() {
+            // Check if the token is a valid task ID.
+            match state.store.get(token).await {
+                Ok(None) => {
+                    return make_json_rpc_error_response(
+                        rpc.id,
+                        -32602,
+                        "Invalid params: invalid pageToken",
+                        None,
+                    )
+                    .into_response();
+                }
+                Err(e) => return make_error_response(rpc.id, e).into_response(),
+                Ok(Some(_)) => {} // valid
+            }
+        }
+    }
+
+    // Validate statusTimestampAfter: must be a valid ISO 8601 timestamp.
+    if let Some(ref ts) = req.status_timestamp_after {
+        if chrono::DateTime::parse_from_rfc3339(ts).is_err() {
+            return make_json_rpc_error_response(
+                rpc.id,
+                -32602,
+                "Invalid params: statusTimestampAfter must be a valid ISO 8601 timestamp",
+                None,
+            )
+            .into_response();
+        }
+    }
 
     match state.store.list(&req).await {
         Ok(resp) => make_success_response(rpc.id, &resp).into_response(),

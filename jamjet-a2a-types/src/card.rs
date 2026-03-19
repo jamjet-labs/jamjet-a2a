@@ -62,7 +62,7 @@ pub struct AgentSkill {
     pub id: String,
     pub name: String,
     pub description: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<String>,

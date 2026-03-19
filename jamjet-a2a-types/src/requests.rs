@@ -45,12 +45,53 @@ pub struct SendMessageRequest {
 // SendMessageResponse
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Response for `SendMessage` — either a full Task or a single Message.
+/// A2A v1.0 wrapped Task response: `{"task": { ... }}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWrapper {
+    pub task: Task,
+}
+
+/// A2A v1.0 wrapped Message response: `{"message": { ... }}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageWrapper {
+    pub message: Message,
+}
+
+/// Response for `SendMessage` — a wrapped Task or Message per A2A v1.0.
+///
+/// A2A v1.0 returns `{"task": {...}}` or `{"message": {...}}`.
+/// For backwards compatibility, also accepts a bare Task or Message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SendMessageResponse {
+    /// `{"task": {...}}` — A2A v1.0 wire format.
+    WrappedTask(TaskWrapper),
+    /// `{"message": {...}}` — A2A v1.0 wire format.
+    WrappedMessage(MessageWrapper),
+    /// Bare Task (backwards compatibility with pre-v1.0 servers).
     Task(Task),
+    /// Bare Message (backwards compatibility with pre-v1.0 servers).
     Message(Message),
+}
+
+impl SendMessageResponse {
+    /// Extract the [`Task`] from the response, regardless of wrapping.
+    pub fn into_task(self) -> Option<Task> {
+        match self {
+            Self::WrappedTask(w) => Some(w.task),
+            Self::Task(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Extract the [`Message`] from the response, regardless of wrapping.
+    pub fn into_message(self) -> Option<Message> {
+        match self {
+            Self::WrappedMessage(w) => Some(w.message),
+            Self::Message(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
