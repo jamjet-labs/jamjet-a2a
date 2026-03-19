@@ -1,11 +1,12 @@
 [package]
 name = "jamjet-a2a-types"
-version = "0.1.0"
+version = "0.1.1"
 description = "A2A v1.0 protocol types — pure data, zero I/O"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 keywords = ["a2a", "agent", "protocol", "types"]
 categories = ["data-structures", "encoding"]
 
