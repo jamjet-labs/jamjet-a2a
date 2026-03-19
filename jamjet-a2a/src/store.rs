@@ -30,6 +30,9 @@ pub trait TaskStore: Send + Sync {
     /// List tasks with cursor-based pagination and optional filters.
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2aError>;
 
+    /// Append a message to an existing task's history.
+    async fn append_message(&self, task_id: &str, message: Message) -> Result<(), A2aError>;
+
     /// Cancel a task. Returns an error if the task is in a terminal state.
     async fn cancel(&self, task_id: &str) -> Result<(), A2aError>;
 
@@ -154,6 +157,22 @@ impl TaskStore for InMemoryTaskStore {
         }
 
         debug!(task_id, "artifact added");
+        Ok(())
+    }
+
+    async fn append_message(&self, task_id: &str, message: Message) -> Result<(), A2aError> {
+        let mut inner = self.inner.lock().await;
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| A2aProtocolError::TaskNotFound {
+                task_id: task_id.to_string(),
+            })?;
+        match task.history {
+            Some(ref mut hist) => hist.push(message),
+            None => task.history = Some(vec![message]),
+        }
+        debug!(task_id, "message appended to history");
         Ok(())
     }
 

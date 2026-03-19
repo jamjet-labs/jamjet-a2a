@@ -318,6 +318,42 @@ async fn handle_send_message(state: ServerState, rpc: IncomingRpc) -> axum::resp
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let context_id = message.context_id.clone();
 
+    // Check if this is a follow-up message to an existing task.
+    let existing_task = if message.task_id.is_some() {
+        state.store.get(&task_id).await.unwrap_or(None)
+    } else {
+        None
+    };
+
+    if let Some(_existing) = existing_task {
+        // Append the message to the existing task's history.
+        if let Err(e) = state.store.append_message(&task_id, message.clone()).await {
+            error!(error = %e, "failed to append message");
+            return make_error_response(rpc.id, e).into_response();
+        }
+
+        // Spawn the handler for the follow-up message.
+        if state.handler.is_some() {
+            let handler = Arc::clone(&state.handler);
+            let store = Arc::clone(&state.store);
+            let tid = task_id.clone();
+            let msg = message;
+
+            tokio::spawn(async move {
+                if let Some(ref h) = *handler {
+                    if let Err(e) = h.handle(tid.clone(), msg, store.clone()).await {
+                        error!(task_id = %tid, error = %e, "handler failed");
+                    }
+                }
+            });
+        }
+
+        let resp_task = state.store.get(&task_id).await.unwrap_or(None);
+        return make_success_response(rpc.id, &serde_json::json!({"task": resp_task}))
+            .into_response();
+    }
+
+    // New task: create and insert.
     let task = Task {
         id: task_id.clone(),
         context_id,
@@ -405,7 +441,21 @@ async fn handle_get_task(state: ServerState, rpc: IncomingRpc) -> axum::response
     };
 
     match state.store.get(&req.id).await {
-        Ok(Some(task)) => make_success_response(rpc.id, &task).into_response(),
+        Ok(Some(mut task)) => {
+            // Apply historyLength limiting.
+            if let Some(hl) = req.history_length {
+                if hl == 0 {
+                    task.history = None;
+                } else if let Some(ref mut hist) = task.history {
+                    let hl = hl as usize;
+                    if hist.len() > hl {
+                        let start = hist.len() - hl;
+                        *hist = hist.split_off(start);
+                    }
+                }
+            }
+            make_success_response(rpc.id, &task).into_response()
+        }
         Ok(None) => make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id: req.id })
             .into_response(),
         Err(e) => make_error_response(rpc.id, e).into_response(),
