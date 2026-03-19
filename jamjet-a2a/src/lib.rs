@@ -21,3 +21,6 @@ pub mod federation;
 
 #[cfg(feature = "coordinator")]
 pub mod coordinator;
+
+#[cfg(feature = "mcp-bridge")]
+pub mod mcp_bridge;
