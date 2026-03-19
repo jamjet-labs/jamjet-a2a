@@ -18,7 +18,7 @@ coordinator = ["client"]
 mcp-bridge = []
 
 [dependencies]
-jamjet-a2a-types = { path = "../jamjet-a2a-types" }
+jamjet-a2a-types = { version = "0.1.0", path = "../jamjet-a2a-types" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
