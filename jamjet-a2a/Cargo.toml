@@ -1,0 +1,40 @@
+[package]
+name = "jamjet-a2a"
+version = "0.1.0"
+description = "Standalone Rust SDK for the A2A protocol — client, server, coordinator, MCP bridge"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["a2a", "agent", "protocol", "sdk"]
+categories = ["network-programming", "web-programming"]
+
+[features]
+default = ["client", "server"]
+client = ["dep:reqwest", "dep:futures"]
+server = ["dep:axum", "dep:tokio-stream", "dep:chrono", "dep:uuid"]
+federation = ["server"]
+coordinator = ["client"]
+mcp-bridge = []
+
+[dependencies]
+jamjet-a2a-types = { path = "../jamjet-a2a-types" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Optional (feature-gated)
+reqwest = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true }
+axum = { workspace = true }
