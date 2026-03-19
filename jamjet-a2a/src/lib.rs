@@ -5,3 +5,13 @@ pub use jamjet_a2a_types as types;
 pub mod client;
 #[cfg(feature = "client")]
 pub use client::A2aClient;
+
+#[cfg(feature = "server")]
+pub mod store;
+#[cfg(feature = "server")]
+pub mod server;
+
+#[cfg(feature = "server")]
+pub use store::{TaskStore, InMemoryTaskStore};
+#[cfg(feature = "server")]
+pub use server::{A2aServer, TaskHandler};

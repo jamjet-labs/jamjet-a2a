@@ -73,7 +73,7 @@ pub struct GetTaskRequest {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Request to list tasks with optional filters and pagination.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
