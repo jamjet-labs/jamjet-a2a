@@ -13,6 +13,7 @@ use crate::security::{SecurityRequirement, SecurityScheme};
 /// The top-level Agent Card describing an agent's identity, capabilities,
 /// skills, and security requirements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCard {
     pub name: String,
     pub description: String,
@@ -41,6 +42,7 @@ pub struct AgentCard {
 
 /// A protocol binding that the agent exposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentInterface {
     pub url: String,
     pub protocol_binding: String,
@@ -55,6 +57,7 @@ pub struct AgentInterface {
 
 /// A skill that an agent can perform.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSkill {
     pub id: String,
     pub name: String,
@@ -77,6 +80,7 @@ pub struct AgentSkill {
 
 /// Capabilities that an agent advertises.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming: Option<bool>,
@@ -94,6 +98,7 @@ pub struct AgentCapabilities {
 
 /// A protocol extension that an agent supports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentExtension {
     pub uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +115,7 @@ pub struct AgentExtension {
 
 /// The organization or entity that provides the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentProvider {
     pub url: String,
     pub organization: String,
@@ -121,6 +127,7 @@ pub struct AgentProvider {
 
 /// A JWS signature attached to the Agent Card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCardSignature {
     pub protected: String,
     pub signature: String,

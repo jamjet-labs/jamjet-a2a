@@ -58,11 +58,21 @@ impl TaskHandler for EchoHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), A2aError> {
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
     let card = AgentCard {
         name: "echo".into(),
         description: "A minimal echo agent".into(),
         version: "1.0".into(),
-        supported_interfaces: vec![],
+        supported_interfaces: vec![AgentInterface {
+            url: format!("http://localhost:{port}"),
+            protocol_binding: "jsonrpc".into(),
+            tenant: None,
+            protocol_version: "1.0".into(),
+        }],
         capabilities: AgentCapabilities {
             streaming: Some(true),
             push_notifications: None,
@@ -84,12 +94,12 @@ async fn main() -> Result<(), A2aError> {
         icon_url: None,
     };
 
-    println!("Starting echo server on http://0.0.0.0:3000");
-    println!("Agent card: http://localhost:3000/.well-known/agent-card.json");
+    println!("Starting echo server on http://0.0.0.0:{port}");
+    println!("Agent card: http://localhost:{port}/.well-known/agent-card.json");
 
     A2aServer::new(card)
         .with_handler(EchoHandler)
-        .with_port(3000)
+        .with_port(port)
         .start()
         .await
 }
