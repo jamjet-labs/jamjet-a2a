@@ -137,6 +137,7 @@ impl A2aServer {
 
         Router::new()
             .route("/.well-known/agent-card.json", get(agent_card_handler))
+            .route("/.well-known/agent.json", get(agent_card_handler))
             .route("/", post(jsonrpc_handler))
             .with_state(state)
     }
@@ -195,14 +196,16 @@ async fn jsonrpc_handler(
     debug!(method = %rpc.method, "incoming JSON-RPC request");
 
     match rpc.method.as_str() {
-        "SendMessage" => handle_send_message(state, rpc).await,
-        "GetTask" => handle_get_task(state, rpc).await,
+        // v1.0 names + v0.3 aliases
+        "SendMessage" | "message/send" => handle_send_message(state, rpc).await,
+        "GetTask" | "tasks/get" => handle_get_task(state, rpc).await,
         "ListTasks" => handle_list_tasks(state, rpc).await,
-        "CancelTask" => handle_cancel_task(state, rpc).await,
-        "SendStreamingMessage" => handle_send_streaming(state, rpc).await,
-        "SubscribeToTask" => handle_subscribe(state, rpc).await,
+        "CancelTask" | "tasks/cancel" => handle_cancel_task(state, rpc).await,
+        "SendStreamingMessage" | "message/stream" => handle_send_streaming(state, rpc).await,
+        "SubscribeToTask" | "tasks/resubscribe" => handle_subscribe(state, rpc).await,
         "GetExtendedAgentCard" => handle_get_extended_card(state, rpc).await,
         "CreateTaskPushNotificationConfig"
+        | "tasks/pushNotificationConfig/set"
         | "GetTaskPushNotificationConfig"
         | "ListTaskPushNotificationConfigs"
         | "DeleteTaskPushNotificationConfig" => make_error_response(
