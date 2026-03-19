@@ -173,29 +173,88 @@ impl A2aServer {
 
 /// `GET /.well-known/agent-card.json`
 async fn agent_card_handler(State(state): State<ServerState>) -> impl IntoResponse {
-    Json(state.card.as_ref().clone())
+    let headers = [
+        (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        (axum::http::header::CACHE_CONTROL, "no-cache"),
+    ];
+    (
+        headers,
+        Json(serde_json::to_value(state.card.as_ref()).unwrap_or(serde_json::json!({}))),
+    )
 }
 
 /// Incoming JSON-RPC request parsed from the POST body.
 /// We use a `Value` for params since each method has different params.
-#[derive(serde::Deserialize)]
 #[allow(dead_code)]
 struct IncomingRpc {
     jsonrpc: String,
     id: serde_json::Value,
     method: String,
-    #[serde(default)]
     params: serde_json::Value,
 }
 
 /// `POST /` — JSON-RPC 2.0 dispatcher.
+///
+/// Uses raw `Bytes` extraction instead of `Json<T>` so that we can return
+/// proper JSON-RPC error responses for malformed JSON (-32700) and invalid
+/// requests (-32600) instead of Axum's default HTTP 422.
 async fn jsonrpc_handler(
     State(state): State<ServerState>,
-    Json(rpc): Json<IncomingRpc>,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
-    debug!(method = %rpc.method, "incoming JSON-RPC request");
+    // Step 1: Parse JSON from raw bytes.
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": "Parse error"}
+            }))
+            .into_response();
+        }
+    };
 
-    match rpc.method.as_str() {
+    // Step 2: Validate jsonrpc field.
+    let jsonrpc = body.get("jsonrpc").and_then(|v| v.as_str());
+    if jsonrpc != Some("2.0") {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32600, "message": "Invalid Request"}
+        }))
+        .into_response();
+    }
+
+    // Step 3: Extract method.
+    let method = match body.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => {
+            let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32600, "message": "Invalid Request"}
+            }))
+            .into_response();
+        }
+    };
+
+    // Step 4: Extract id and params.
+    let rpc_id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let params = body.get("params").cloned().unwrap_or(serde_json::Value::Null);
+
+    let rpc = IncomingRpc {
+        jsonrpc: "2.0".to_string(),
+        id: rpc_id,
+        method: method.clone(),
+        params,
+    };
+
+    debug!(method = %method, "incoming JSON-RPC request");
+
+    match method.as_str() {
         // v1.0 names + v0.3 aliases
         "SendMessage" | "message/send" => handle_send_message(state, rpc).await,
         "GetTask" | "tasks/get" => handle_get_task(state, rpc).await,

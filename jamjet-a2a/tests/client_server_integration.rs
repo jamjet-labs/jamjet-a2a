@@ -324,3 +324,146 @@ async fn extended_card_returns_agent_card() {
         .expect("get_extended_card failed");
     assert_eq!(card.name, "echo-agent");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// JSON-RPC 2.0 validation tests (TCK compliance)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn malformed_json_returns_parse_error() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(&base_url)
+        .header("content-type", "application/json")
+        .body("this is not json{{{")
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(body["id"].is_null());
+    assert_eq!(body["error"]["code"], -32700);
+    assert_eq!(body["error"]["message"], "Parse error");
+}
+
+#[tokio::test]
+async fn missing_jsonrpc_field_returns_invalid_request() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "id": 1,
+            "method": "GetTask",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "Invalid Request");
+}
+
+#[tokio::test]
+async fn wrong_jsonrpc_version_returns_invalid_request() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 2,
+            "method": "GetTask",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 2);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "Invalid Request");
+}
+
+#[tokio::test]
+async fn missing_method_field_returns_invalid_request() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 3);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "Invalid Request");
+}
+
+#[tokio::test]
+async fn missing_id_returns_null_id_in_response() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(&base_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "UnknownMethod",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(body["id"].is_null());
+    assert_eq!(body["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn agent_card_has_cors_headers() {
+    let base_url = start_server().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .get(format!("{base_url}/.well-known/agent-card.json"))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+        Some("*")
+    );
+    assert_eq!(
+        resp.headers().get("cache-control").map(|v| v.to_str().unwrap()),
+        Some("no-cache")
+    );
+}
