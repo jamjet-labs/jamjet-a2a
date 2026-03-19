@@ -162,18 +162,25 @@ impl TaskStore for InMemoryTaskStore {
         let total_size = inner.order.len() as i32;
 
         // Find the starting index based on the page_token (cursor).
+        // Invalid tokens yield an empty result set (not an error).
         let start_idx = if let Some(ref token) = req.page_token {
-            inner
-                .order
-                .iter()
-                .position(|id| id == token)
-                .map(|pos| pos + 1) // start after the cursor
-                .unwrap_or(inner.order.len())
+            if token.is_empty() {
+                0
+            } else {
+                inner
+                    .order
+                    .iter()
+                    .position(|id| id == token)
+                    .map(|pos| pos + 1) // start after the cursor
+                    .unwrap_or(inner.order.len()) // unknown token → past end → empty
+            }
         } else {
             0
         };
 
-        let page_size = req.page_size.unwrap_or(20).max(1) as usize;
+        // Default 50, floor 1, cap 100.
+        let raw_page_size = req.page_size.unwrap_or(50);
+        let page_size = raw_page_size.max(1).min(100) as usize;
 
         // Collect matching tasks from insertion order.
         let mut tasks = Vec::new();

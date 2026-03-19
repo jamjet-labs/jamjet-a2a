@@ -1,6 +1,6 @@
 [package]
 name = "jamjet-a2a-types"
-version = "0.1.1"
+version = "0.1.2"
 description = "A2A v1.0 protocol types — pure data, zero I/O"
 edition.workspace = true
 rust-version.workspace = true

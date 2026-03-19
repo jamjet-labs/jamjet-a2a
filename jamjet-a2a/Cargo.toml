@@ -1,6 +1,6 @@
 [package]
 name = "jamjet-a2a"
-version = "0.1.1"
+version = "0.1.2"
 description = "Standalone Rust SDK for the A2A protocol — client, server, coordinator, MCP bridge"
 edition.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,7 @@ coordinator = ["client"]
 mcp-bridge = []
 
 [dependencies]
-jamjet-a2a-types = { version = "0.1.1", path = "../jamjet-a2a-types" }
+jamjet-a2a-types = { version = "0.1.2", path = "../jamjet-a2a-types" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

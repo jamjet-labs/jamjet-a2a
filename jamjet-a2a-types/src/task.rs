@@ -9,8 +9,11 @@ use std::collections::HashMap;
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Terminal and non-terminal states a task can occupy.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+///
+/// Accepts both SCREAMING_SNAKE_CASE (`"SUBMITTED"`) and proto-prefixed
+/// (`"TASK_STATE_SUBMITTED"`) formats on deserialization. Always serializes
+/// to SCREAMING_SNAKE_CASE.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TaskState {
     Submitted,
@@ -21,6 +24,45 @@ pub enum TaskState {
     InputRequired,
     Rejected,
     AuthRequired,
+}
+
+impl Serialize for TaskState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            TaskState::Submitted => "SUBMITTED",
+            TaskState::Working => "WORKING",
+            TaskState::Completed => "COMPLETED",
+            TaskState::Failed => "FAILED",
+            TaskState::Canceled => "CANCELED",
+            TaskState::InputRequired => "INPUT_REQUIRED",
+            TaskState::Rejected => "REJECTED",
+            TaskState::AuthRequired => "AUTH_REQUIRED",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "SUBMITTED" | "TASK_STATE_SUBMITTED" | "submitted" => Ok(TaskState::Submitted),
+            "WORKING" | "TASK_STATE_WORKING" | "working" => Ok(TaskState::Working),
+            "COMPLETED" | "TASK_STATE_COMPLETED" | "completed" => Ok(TaskState::Completed),
+            "FAILED" | "TASK_STATE_FAILED" | "failed" => Ok(TaskState::Failed),
+            "CANCELED" | "TASK_STATE_CANCELED" | "canceled" => Ok(TaskState::Canceled),
+            "INPUT_REQUIRED" | "TASK_STATE_INPUT_REQUIRED" | "input_required" => {
+                Ok(TaskState::InputRequired)
+            }
+            "REJECTED" | "TASK_STATE_REJECTED" | "rejected" => Ok(TaskState::Rejected),
+            "AUTH_REQUIRED" | "TASK_STATE_AUTH_REQUIRED" | "auth_required" => {
+                Ok(TaskState::AuthRequired)
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown task state: {other}"
+            ))),
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -42,12 +84,35 @@ pub struct TaskStatus {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Who authored a message.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+///
+/// Accepts both lowercase (`"user"`, `"agent"`) and proto-style
+/// (`"ROLE_USER"`, `"ROLE_AGENT"`, `"USER"`, `"AGENT"`) on deserialization.
+/// Always serializes to lowercase.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Role {
     User,
     Agent,
+}
+
+impl Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Role::User => serializer.serialize_str("user"),
+            Role::Agent => serializer.serialize_str("agent"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "user" | "ROLE_USER" | "USER" => Ok(Role::User),
+            "agent" | "ROLE_AGENT" | "AGENT" => Ok(Role::Agent),
+            other => Err(serde::de::Error::custom(format!("unknown role: {other}"))),
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -310,5 +375,57 @@ mod tests {
         let back: Task = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "task-1");
         assert_eq!(back.status.state, TaskState::Working);
+    }
+
+    // ── Role proto-format acceptance ──────────────────────────────────────
+
+    #[test]
+    fn role_accepts_proto_format() {
+        let r: Role = serde_json::from_str("\"ROLE_USER\"").unwrap();
+        assert_eq!(r, Role::User);
+        let r: Role = serde_json::from_str("\"ROLE_AGENT\"").unwrap();
+        assert_eq!(r, Role::Agent);
+    }
+
+    #[test]
+    fn role_accepts_screaming_format() {
+        let r: Role = serde_json::from_str("\"USER\"").unwrap();
+        assert_eq!(r, Role::User);
+        let r: Role = serde_json::from_str("\"AGENT\"").unwrap();
+        assert_eq!(r, Role::Agent);
+    }
+
+    #[test]
+    fn role_rejects_unknown() {
+        let result = serde_json::from_str::<Role>("\"ROLE_SYSTEM\"");
+        assert!(result.is_err());
+    }
+
+    // ── TaskState proto-format acceptance ─────────────────────────────────
+
+    #[test]
+    fn task_state_accepts_proto_format() {
+        let s: TaskState = serde_json::from_str("\"TASK_STATE_SUBMITTED\"").unwrap();
+        assert_eq!(s, TaskState::Submitted);
+        let s: TaskState = serde_json::from_str("\"TASK_STATE_WORKING\"").unwrap();
+        assert_eq!(s, TaskState::Working);
+        let s: TaskState = serde_json::from_str("\"TASK_STATE_COMPLETED\"").unwrap();
+        assert_eq!(s, TaskState::Completed);
+        let s: TaskState = serde_json::from_str("\"TASK_STATE_INPUT_REQUIRED\"").unwrap();
+        assert_eq!(s, TaskState::InputRequired);
+    }
+
+    #[test]
+    fn task_state_accepts_lowercase_format() {
+        let s: TaskState = serde_json::from_str("\"submitted\"").unwrap();
+        assert_eq!(s, TaskState::Submitted);
+        let s: TaskState = serde_json::from_str("\"working\"").unwrap();
+        assert_eq!(s, TaskState::Working);
+    }
+
+    #[test]
+    fn task_state_rejects_unknown() {
+        let result = serde_json::from_str::<TaskState>("\"TASK_STATE_RUNNING\"");
+        assert!(result.is_err());
     }
 }
