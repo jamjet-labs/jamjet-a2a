@@ -86,14 +86,17 @@ async fn layer_enforces_method_scopes() {
         assert_auth_code(&body, FORBIDDEN_ERROR_CODE);
     }
 
-    let (status, _) = rpc(
-        &url,
-        Some("tok-alpha"),
-        "SendMessage",
-        json!({"message": message("m-1", "x", None, None)}),
-    )
-    .await;
-    assert_eq!(status, 200);
+    // A token with the scope may use either name.
+    for method in ["SendMessage", "message/send"] {
+        let (status, body) = rpc(
+            &url,
+            Some("tok-alpha"),
+            method,
+            json!({"message": message("m-1", "x", None, None)}),
+        )
+        .await;
+        assert_eq!(status, 200, "{method}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -184,6 +187,11 @@ async fn policy_as_authenticator_binds_tasks_and_checks_scopes() {
     let (_, body) = rpc(&url, Some("tok-beta"), "GetTask", json!({"id": task_id})).await;
     assert_eq!(error_code(&body), Some(TASK_NOT_FOUND), "{body}");
     let (_, body) = rpc(&url, alpha, "GetTask", json!({"id": task_id})).await;
+    assert_eq!(body["result"]["id"], task_id.as_str(), "{body}");
+
+    // v0.3 aliases get the scopes of their v1.0 names.
+    let (status, body) = rpc(&url, alpha, "tasks/get", json!({"id": task_id})).await;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"]["id"], task_id.as_str(), "{body}");
 }
 
