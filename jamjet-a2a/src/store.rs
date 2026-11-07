@@ -488,7 +488,10 @@ impl TaskStore for InMemoryTaskStore {
         }
 
         let history_bytes = task.history.iter().flatten().map(json_bytes).sum::<usize>();
-        let bytes = history_bytes + task.artifacts.iter().map(json_bytes).sum::<usize>();
+        // Client metadata is stored on the task, so it counts too.
+        let bytes = history_bytes
+            + task.artifacts.iter().map(json_bytes).sum::<usize>()
+            + task.metadata.as_ref().map_or(0, json_bytes);
         inner.make_room(&owner, true, bytes, limits)?;
 
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -1456,6 +1459,40 @@ mod tests {
         // Another owner has its own budget.
         store
             .insert(task_with_text("a1", 3000), Some("alice".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_metadata_counts_toward_the_owner_budget() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_bytes_per_owner: 4096,
+            ..Default::default()
+        });
+        let with_metadata = |id: &str| {
+            let mut t = test_task(id);
+            t.metadata = Some(
+                [("blob".to_string(), serde_json::json!("x".repeat(3000)))]
+                    .into_iter()
+                    .collect(),
+            );
+            t
+        };
+        store
+            .insert(with_metadata("m1"), Some("bob".into()))
+            .await
+            .unwrap();
+        let err = store
+            .insert(with_metadata("m2"), Some("bob".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, A2aError::Store(A2aStoreError::OwnerStorageFull { .. })),
+            "got {err:?}"
+        );
+        // Another owner is unaffected.
+        store
+            .insert(with_metadata("m3"), Some("alice".into()))
             .await
             .unwrap();
     }

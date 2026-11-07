@@ -417,6 +417,11 @@ impl A2aServer {
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
+                Err(e) if !accept_error_is_fatal(&e) => {
+                    warn!(error = %e, "accept failed, retrying");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
                 Err(e) => {
                     error!(error = %e, "accept failed, stopping the server");
                     return Err(A2aTransportError::Connection {
@@ -479,6 +484,16 @@ fn is_resource_error(e: &std::io::Error) -> bool {
     // EMFILE, ENFILE, ENOMEM, ENOBUFS (Linux 105, BSD/macOS 55).
     matches!(e.raw_os_error(), Some(24 | 23 | 12 | 105 | 55))
         || e.kind() == std::io::ErrorKind::OutOfMemory
+}
+
+/// Accept errors that mean the listener itself is unusable. Every other
+/// accept error is retried: on Linux, accept(2) also reports pending network
+/// errors such as ENETDOWN, EPROTO or EHOSTUNREACH for the one connection.
+fn accept_error_is_fatal(e: &std::io::Error) -> bool {
+    // EBADF and EINVAL are the same on every platform; ENOTSOCK is 88 on
+    // Linux and 38 on macOS and the BSDs.
+    matches!(e.raw_os_error(), Some(9 | 22 | 88 | 38))
+        || e.kind() == std::io::ErrorKind::InvalidInput
 }
 
 /// True when the server would accept connections from other hosts with no
@@ -1422,6 +1437,39 @@ fn make_json_rpc_error_response(
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn only_listener_errors_stop_the_accept_loop() {
+        use std::io::Error;
+        // EPERM (1) is the same everywhere; the rest differ by platform.
+        let mut retry = vec![1];
+        #[cfg(target_os = "linux")]
+        retry.extend([100, 71, 92, 112, 64, 113, 95, 101]);
+        #[cfg(target_os = "macos")]
+        retry.extend([50, 100, 42, 64, 65, 102, 51]);
+        for n in retry {
+            assert!(
+                !accept_error_is_fatal(&Error::from_raw_os_error(n)),
+                "errno {n} should be retried"
+            );
+        }
+        // EBADF, EINVAL, ENOTSOCK.
+        let mut fatal = vec![9, 22];
+        #[cfg(target_os = "linux")]
+        fatal.push(88);
+        #[cfg(target_os = "macos")]
+        fatal.push(38);
+        for n in fatal {
+            assert!(
+                accept_error_is_fatal(&Error::from_raw_os_error(n)),
+                "errno {n} should stop the server"
+            );
+        }
+        assert!(accept_error_is_fatal(&Error::from(
+            std::io::ErrorKind::InvalidInput
+        )));
+        assert!(!accept_error_is_fatal(&Error::from_raw_os_error(24))); // EMFILE
+    }
 
     #[test]
     fn warns_only_for_non_loopback_without_authenticator() {
