@@ -7,14 +7,18 @@ pub mod client;
 pub use client::A2aClient;
 
 #[cfg(feature = "server")]
+pub mod auth;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
 pub mod store;
 
 #[cfg(feature = "server")]
+pub use auth::{Authenticator, Principal};
+#[cfg(feature = "server")]
 pub use server::{A2aServer, TaskHandler};
 #[cfg(feature = "server")]
-pub use store::{InMemoryTaskStore, TaskStore};
+pub use store::{InMemoryTaskStore, StoreLimits, TaskRecord, TaskStore};
 
 #[cfg(feature = "federation")]
 pub mod federation;

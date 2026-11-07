@@ -65,6 +65,26 @@ impl<'de> Deserialize<'de> for TaskState {
     }
 }
 
+impl TaskState {
+    /// True for the states A2A v1.0 defines as terminal: `Completed`,
+    /// `Failed`, `Canceled` and `Rejected`.
+    ///
+    /// A task in a terminal state is final. It accepts no further messages,
+    /// status changes or artifacts, and streams on it close.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
+        )
+    }
+
+    /// True for the interrupted states, `InputRequired` and `AuthRequired`,
+    /// where the task waits for the client before it can continue.
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, TaskState::InputRequired | TaskState::AuthRequired)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // TaskStatus
 // ────────────────────────────────────────────────────────────────────────────
@@ -426,6 +446,32 @@ mod tests {
         assert_eq!(s, TaskState::Submitted);
         let s: TaskState = serde_json::from_str("\"working\"").unwrap();
         assert_eq!(s, TaskState::Working);
+    }
+
+    #[test]
+    fn terminal_states_match_the_spec() {
+        // A2A v1.0: completed, failed, canceled and rejected are terminal.
+        let terminal = [
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+        ];
+        let not_terminal = [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+        ];
+        for s in terminal {
+            assert!(s.is_terminal(), "{s:?} should be terminal");
+        }
+        for s in not_terminal {
+            assert!(!s.is_terminal(), "{s:?} should not be terminal");
+        }
+        assert!(TaskState::InputRequired.is_interrupted());
+        assert!(TaskState::AuthRequired.is_interrupted());
+        assert!(!TaskState::Working.is_interrupted());
     }
 
     #[test]

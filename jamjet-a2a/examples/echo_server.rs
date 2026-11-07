@@ -1,6 +1,10 @@
 //! Minimal A2A echo server.
 //!
 //! Run with: cargo run --example echo_server
+//!
+//! It listens on 127.0.0.1 by default. Set `HOST=0.0.0.0` to listen on all
+//! interfaces; without an authenticator that exposes every task to anyone
+//! who can reach the port, and the server logs a warning.
 
 use jamjet_a2a::server::{A2aServer, TaskHandler};
 use jamjet_a2a::store::TaskStore;
@@ -69,6 +73,10 @@ async fn main() -> Result<(), A2aError> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let host: std::net::IpAddr = std::env::var("HOST")
+        .ok()
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
     let card = AgentCard {
         name: "echo".into(),
@@ -101,11 +109,12 @@ async fn main() -> Result<(), A2aError> {
         icon_url: None,
     };
 
-    println!("Starting echo server on http://0.0.0.0:{port}");
+    println!("Starting echo server on http://{host}:{port}");
     println!("Agent card: http://localhost:{port}/.well-known/agent-card.json");
 
     A2aServer::new(card)
         .with_handler(EchoHandler)
+        .with_bind_addr(host)
         .with_port(port)
         .start()
         .await

@@ -731,26 +731,27 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jamjet-a2a"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
  "chrono",
  "futures",
+ "hyper-util",
  "jamjet-a2a-types",
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "jamjet-a2a-types"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64",
  "proptest",
@@ -1535,18 +1536,6 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
 name = "jamjet-a2a"
-version = "0.1.2"
+version = "0.2.0"
 description = "Standalone Rust SDK for the A2A protocol — client, server, coordinator, MCP bridge"
 edition.workspace = true
 rust-version.workspace = true
@@ -13,13 +13,13 @@ categories = ["network-programming", "web-programming"]
 [features]
 default = ["client", "server"]
 client = ["dep:reqwest", "dep:futures"]
-server = ["dep:axum", "dep:tokio-stream", "dep:chrono", "dep:uuid"]
-federation = ["server", "dep:reqwest"]
+server = ["dep:axum", "dep:futures", "dep:chrono", "dep:uuid", "dep:hyper-util"]
+federation = ["server", "dep:reqwest", "dep:subtle"]
 coordinator = ["client"]
 mcp-bridge = []
 
 [dependencies]
-jamjet-a2a-types = { version = "0.1.2", path = "../jamjet-a2a-types" }
+jamjet-a2a-types = { version = "0.2.0", path = "../jamjet-a2a-types" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,12 +31,13 @@ thiserror = { workspace = true }
 reqwest = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 reqwest = { workspace = true }
 axum = { workspace = true }
 async-trait = { workspace = true }
