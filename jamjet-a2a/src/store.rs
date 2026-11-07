@@ -36,6 +36,13 @@ pub struct TaskRecord {
 ///   [`A2aProtocolError::TaskTerminal`] and change nothing. The check and the
 ///   write must be atomic.
 /// - `list` returns only the tasks whose owner equals the `owner` argument.
+///   The server validates a `pageToken` by looking it up as a task id, so
+///   cursors must be task ids.
+/// - `subscribe` returns a channel for that one task. Every status change
+///   (including the terminal one, and cancellation) and every artifact is
+///   sent on it. When a task is evicted its sender is dropped, which ends
+///   open streams.
+/// - `cancel` checks the state and writes `Canceled` atomically.
 #[async_trait::async_trait]
 pub trait TaskStore: Send + Sync {
     /// Insert a new task bound to `owner`.

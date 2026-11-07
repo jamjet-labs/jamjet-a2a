@@ -529,12 +529,17 @@ impl Default for A2aClient {
 // SSE stream parser
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Largest single SSE event the client buffers before giving up on the
+/// stream, so a server cannot grow client memory without bound.
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Parse an SSE byte stream into a stream of [`StreamResponse`] events.
 ///
 /// TCP chunks are NOT aligned to SSE event boundaries, so we buffer bytes
 /// across chunks and split on the `\n\n` delimiter before decoding. The
 /// stream ends with [`A2aTransportError::Timeout`] if no bytes arrive for
-/// `idle_timeout`.
+/// `idle_timeout`, and with an error if one event grows past
+/// `MAX_SSE_EVENT_BYTES`.
 fn parse_sse_stream(
     response: reqwest::Response,
     url: String,
@@ -546,6 +551,8 @@ fn parse_sse_stream(
     struct SseState<S> {
         body: S,
         buf: Vec<u8>,
+        /// Bytes of `buf` already searched for a delimiter.
+        scanned: usize,
         pending: VecDeque<Result<StreamResponse, A2aError>>,
         done: bool,
         url: String,
@@ -553,8 +560,17 @@ fn parse_sse_stream(
     }
 
     fn drain_events<S>(st: &mut SseState<S>) {
-        while let Some(pos) = st.buf.windows(2).position(|w| w == b"\n\n") {
+        loop {
+            // Resume the search one byte back, in case a chunk ended between
+            // the two newlines.
+            let from = st.scanned.saturating_sub(1);
+            let Some(rel) = st.buf[from..].windows(2).position(|w| w == b"\n\n") else {
+                st.scanned = st.buf.len();
+                return;
+            };
+            let pos = from + rel;
             let block: Vec<u8> = st.buf.drain(..pos + 2).collect();
+            st.scanned = 0;
             let text = String::from_utf8_lossy(&block[..pos]);
             for line in text.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
@@ -573,6 +589,7 @@ fn parse_sse_stream(
     let init = SseState {
         body: response.bytes_stream().boxed(),
         buf: Vec::new(),
+        scanned: 0,
         pending: VecDeque::new(),
         done: false,
         url,
@@ -607,6 +624,16 @@ fn parse_sse_stream(
                 Ok(Some(Ok(chunk))) => {
                     st.buf.extend_from_slice(&chunk);
                     drain_events(&mut st);
+                    if st.buf.len() > MAX_SSE_EVENT_BYTES {
+                        st.done = true;
+                        st.pending
+                            .push_back(Err(A2aTransportError::InvalidResponse {
+                                details: format!(
+                                    "SSE event larger than {MAX_SSE_EVENT_BYTES} bytes"
+                                ),
+                            }
+                            .into()));
+                    }
                 }
             }
         }

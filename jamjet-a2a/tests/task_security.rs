@@ -31,6 +31,7 @@ impl Authenticator for TestTokens {
             Some("alice-token") => Ok(Principal::new("alice")),
             Some("bob-token") => Ok(Principal::new("bob")),
             Some("reader-token") => Ok(Principal::new("reader")),
+            Some("empty-id-token") => Ok(Principal::new("")),
             _ => Err(A2aError::Auth {
                 reason: "unknown token".into(),
             }),
@@ -451,4 +452,115 @@ async fn handler_does_not_run_for_a_task_canceled_before_it_started() {
         !ran.load(std::sync::atomic::Ordering::SeqCst),
         "handler ran for a canceled task"
     );
+}
+
+// ── review follow-ups ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn principal_with_empty_id_is_rejected() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_authenticator(TestTokens),
+    )
+    .await;
+    let (status, body) = rpc(&url, Some("empty-id-token"), "ListTasks", json!({})).await;
+    assert_eq!(status, 401, "{body}");
+}
+
+#[tokio::test]
+async fn unauthenticated_request_is_rejected_before_its_body_is_read() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_authenticator(TestTokens),
+    )
+    .await;
+    // 3 MB is over the 2 MB body limit. Reading the body first would give 413.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/"))
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn follow_up_without_context_gets_the_tasks_context() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(HoldHandler)).await;
+    let task_id = create_task(&url, None, Some("ctx-1")).await;
+
+    let (_, body) = rpc(
+        &url,
+        None,
+        "SendMessage",
+        json!({"message": message("m-2", "more", Some(&task_id), None)}),
+    )
+    .await;
+    let history = &body["result"]["task"]["history"];
+    assert_eq!(history[1]["contextId"], "ctx-1", "{body}");
+}
+
+/// Asks for input on the first message and completes on the next one.
+struct AskThenFinishHandler;
+
+#[async_trait::async_trait]
+impl jamjet_a2a::server::TaskHandler for AskThenFinishHandler {
+    async fn handle(
+        &self,
+        task_id: String,
+        message: Message,
+        store: std::sync::Arc<dyn jamjet_a2a::store::TaskStore>,
+    ) -> Result<(), A2aError> {
+        let first = message.message_id == "s-1" || message.message_id == "m-1";
+        let state = if first {
+            TaskState::InputRequired
+        } else {
+            TaskState::Completed
+        };
+        store
+            .update_status(
+                &task_id,
+                TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn stream_ends_when_the_task_needs_input() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(AskThenFinishHandler)).await;
+    let stream = A2aClient::new()
+        .send_streaming(&url, send_request("hi"))
+        .await
+        .unwrap();
+    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("stream did not close when the task asked for input");
+    let last = events.last().expect("no events").as_ref().unwrap();
+    assert_eq!(state_of(last), Some(TaskState::InputRequired));
+}
+
+#[tokio::test]
+async fn follow_up_stream_ends_when_the_task_completes() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(AskThenFinishHandler)).await;
+    let task_id = create_task(&url, None, None).await;
+    wait_for_state(&url, None, &task_id, "TASK_STATE_INPUT_REQUIRED").await;
+
+    let mut req = send_request("here is the input");
+    req.message.message_id = "s-2".into();
+    req.message.task_id = Some(task_id.clone());
+    let stream = A2aClient::new().send_streaming(&url, req).await.unwrap();
+    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("follow-up stream did not close after the task completed");
+    let last = events.last().expect("no events").as_ref().unwrap();
+    assert_eq!(state_of(last), Some(TaskState::Completed));
 }

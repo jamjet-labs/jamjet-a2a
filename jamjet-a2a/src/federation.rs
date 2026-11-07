@@ -30,7 +30,13 @@ use tracing::{info, warn};
 /// caller, or as an Axum layer via [`federation_auth_layer`].
 ///
 /// Authentication is required unless `require_auth` is explicitly set to
-/// `false`.
+/// `false`. With `require_auth: false` every caller without a token shares
+/// one `anonymous` principal, so the server is effectively single-tenant
+/// for them, and the startup warning does not fire.
+///
+/// `public_agent_card` only matters for [`federation_auth_layer`]. As the
+/// server's authenticator the policy only sees JSON-RPC requests; the Agent
+/// Card routes stay public.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationPolicy {
     /// If true (the default), every request except the public Agent Card
@@ -52,10 +58,15 @@ pub struct FederationPolicy {
     pub allowed_agents: Vec<String>,
 
     /// Scopes required per RPC method. Maps method names to required
-    /// scopes; the caller needs at least one of them. Keys may use the v1.0
-    /// names ("SendMessage", "GetTask", ...) or the v0.3 aliases
-    /// ("message/send", ...); both spellings of a method are checked against
-    /// the same entry. Methods without an entry are allowed.
+    /// scopes; the caller needs at least one of them, and an empty list means
+    /// any authenticated caller. Keys may use the v1.0 names ("SendMessage",
+    /// "GetTask", ...) or the v0.3 aliases ("message/send", ...); both
+    /// spellings of a method are checked against the same entry.
+    ///
+    /// An empty map puts no scope restrictions on any method. Once the map
+    /// has an entry, it is an allowlist: a method without an entry (including
+    /// one whose key is misspelled) is refused. List every method callers
+    /// need, e.g. `SendStreamingMessage` next to `SendMessage`.
     #[serde(default)]
     pub method_scopes: HashMap<String, Vec<String>>,
 }
@@ -189,14 +200,22 @@ pub fn validate_federation_token(
 /// Both the requested method and the policy keys are mapped to their v1.0
 /// names first, so `message/send` is held to the scopes configured for
 /// `SendMessage` and the other way round. If several keys name the same
-/// method, each of them must be satisfied.
+/// method, each of them must be satisfied. With a non-empty map, a method
+/// that no key names is refused.
 fn scopes_allow(policy: &FederationPolicy, method: &str, has_scope: impl Fn(&str) -> bool) -> bool {
+    if policy.method_scopes.is_empty() {
+        return true;
+    }
     let target = canonical_method(method).unwrap_or(method);
-    policy
+    let mut entries = policy
         .method_scopes
         .iter()
         .filter(|(key, _)| canonical_method(key).unwrap_or(key) == target)
-        .all(|(_, required)| required.is_empty() || required.iter().any(|s| has_scope(s)))
+        .peekable();
+    if entries.peek().is_none() {
+        return false;
+    }
+    entries.all(|(_, required)| required.is_empty() || required.iter().any(|s| has_scope(s)))
 }
 
 /// Check if an identity has the required scopes for a given RPC method.
@@ -565,6 +584,35 @@ mod tests {
             .into_iter()
             .collect();
         assert!(!check_method_scopes(&identity, "CancelTask", &policy));
+    }
+
+    #[test]
+    fn method_scopes_are_an_allowlist_once_set() {
+        let policy = test_policy();
+        let identity =
+            validate_federation_token(&headers_with_token("tok-alpha"), &policy).unwrap();
+        // test_policy lists SendMessage and GetTask only.
+        assert!(!check_method_scopes(
+            &identity,
+            "SendStreamingMessage",
+            &policy
+        ));
+        assert!(!check_method_scopes(&identity, "CancelTask", &policy));
+
+        // A misspelled key does not leave the real method open.
+        let mut typo = test_policy();
+        typo.method_scopes = [("sendMessage".to_string(), vec!["admin".to_string()])]
+            .into_iter()
+            .collect();
+        assert!(!check_method_scopes(&identity, "SendMessage", &typo));
+
+        // An empty list means any authenticated caller; an empty map means
+        // no restrictions at all.
+        let mut open = test_policy();
+        open.method_scopes = [("ListTasks".to_string(), vec![])].into_iter().collect();
+        assert!(check_method_scopes(&identity, "ListTasks", &open));
+        open.method_scopes.clear();
+        assert!(check_method_scopes(&identity, "CancelTask", &open));
     }
 
     #[test]

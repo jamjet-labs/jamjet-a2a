@@ -26,8 +26,7 @@
 pub use crate::auth::{Authenticator, Principal};
 use crate::store::{InMemoryTaskStore, TaskStore};
 use axum::{
-    extract::{Extension, State},
-    http::HeaderMap,
+    extract::State,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
@@ -53,6 +52,12 @@ use tracing::{debug, error, info, warn};
 /// Once the task reaches a terminal state the store refuses further changes,
 /// so a handler should treat [`A2aProtocolError::TaskTerminal`] (for example
 /// after the client canceled the task) as a signal to stop.
+///
+/// Tenancy stops at this trait. The handler is not told who the caller is,
+/// and `TaskStore::get` ignores ownership. A handler that looks up other
+/// tasks (for example `referenceTaskIds`) or keeps memory per `contextId`
+/// must scope that itself: clients choose `contextId` values freely, so two
+/// callers can send the same one.
 #[async_trait::async_trait]
 pub trait TaskHandler: Send + Sync {
     async fn handle(
@@ -287,34 +292,42 @@ struct IncomingRpc {
     params: serde_json::Value,
 }
 
+/// Largest JSON-RPC request body the server reads (Axum's default limit).
+const MAX_RPC_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// `POST /` — JSON-RPC 2.0 dispatcher.
 ///
-/// Uses raw `Bytes` extraction instead of `Json<T>` so that we can return
+/// Reads the raw body instead of using `Json<T>` so that we can return
 /// proper JSON-RPC error responses for malformed JSON (-32700) and invalid
 /// requests (-32600) instead of Axum's default HTTP 422.
 async fn jsonrpc_handler(
     State(state): State<ServerState>,
-    headers: HeaderMap,
-    layer_principal: Option<Extension<Principal>>,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
-    // Step 0: Authenticate before looking at the body. With an authenticator
+    let (parts, body) = request.into_parts();
+
+    // Step 0: Authenticate before reading the body. With an authenticator
     // configured it decides; otherwise use a principal set by an outer layer
     // (e.g. federation_auth_layer), if any.
     let principal = match &state.authenticator {
-        Some(auth) => match auth.authenticate(&headers).await {
+        Some(auth) => match auth.authenticate(&parts.headers).await {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "A2A request rejected: authentication failed");
                 return crate::auth::unauthenticated_response();
             }
         },
-        None => layer_principal.map(|Extension(p)| p),
+        None => parts.extensions.get::<Principal>().cloned(),
     };
     if principal.as_ref().is_some_and(|p| p.id.is_empty()) {
         error!("A2A request rejected: principal has an empty id");
         return crate::auth::unauthenticated_response();
     }
+
+    let body = match axum::body::to_bytes(body, MAX_RPC_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
 
     // Step 1: Parse JSON from raw bytes.
     let body: serde_json::Value = match serde_json::from_slice(&body) {
@@ -453,7 +466,8 @@ fn parse_params<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Add a follow-up message to an existing task the caller can see.
+/// Add a follow-up message to an existing task the caller can see. A message
+/// without a `contextId` gets the task's.
 ///
 /// Fails with `TaskNotFoundError` if the task is missing or belongs to
 /// someone else, with `UnsupportedOperationError` if it is in a terminal
@@ -464,7 +478,7 @@ async fn continue_task(
     rpc_id: &serde_json::Value,
     task: &Task,
     message: &Message,
-) -> Result<(), Json<serde_json::Value>> {
+) -> Result<Message, Json<serde_json::Value>> {
     if task.status.state.is_terminal() {
         return Err(make_error_response(
             rpc_id.clone(),
@@ -481,12 +495,18 @@ async fn continue_task(
             None,
         ));
     }
+    // A2A v1.0 3.4.3: with only a taskId, the context comes from the task.
+    let mut message = message.clone();
+    if message.context_id.is_none() {
+        message.context_id = task.context_id.clone();
+    }
     // The store re-checks the terminal state atomically with the append.
     state
         .store
         .append_message(&task.id, message.clone())
         .await
-        .map_err(|e| make_error_response(rpc_id.clone(), e))
+        .map_err(|e| make_error_response(rpc_id.clone(), e))?;
+    Ok(message)
 }
 
 /// Build a new task in the `Submitted` state with a server-generated id.
@@ -592,9 +612,10 @@ async fn handle_send_message(
                 Ok(t) => t,
                 Err(e) => return make_error_response(rpc.id, e).into_response(),
             };
-            if let Err(resp) = continue_task(&state, &rpc.id, &task, &message).await {
-                return resp.into_response();
-            }
+            let message = match continue_task(&state, &rpc.id, &task, &message).await {
+                Ok(m) => m,
+                Err(resp) => return resp.into_response(),
+            };
             spawn_handler(&state, task.id.clone(), message, false);
             task.id
         }
@@ -769,7 +790,7 @@ async fn handle_send_streaming(
     };
     let message = req.message.clone();
 
-    let (task_id, rx, new) = match message.task_id.as_deref() {
+    let (task_id, rx, message, new) = match message.task_id.as_deref() {
         // Follow-up: subscribe before appending, so that a terminal update
         // either lands on this stream or makes the append fail.
         Some(task_id) => {
@@ -786,10 +807,11 @@ async fn handle_send_streaming(
                 )
                 .into_response();
             };
-            if let Err(resp) = continue_task(&state, &rpc.id, &task, &message).await {
-                return resp.into_response();
-            }
-            (task.id, rx, false)
+            let message = match continue_task(&state, &rpc.id, &task, &message).await {
+                Ok(m) => m,
+                Err(resp) => return resp.into_response(),
+            };
+            (task.id, rx, message, false)
         }
         // New task: the server picks the id. Nothing can update the task
         // until the handler is spawned, so subscribing after insert is safe.
@@ -809,7 +831,7 @@ async fn handle_send_streaming(
                 )
                 .into_response();
             };
-            (task_id, rx, true)
+            (task_id, rx, message, true)
         }
     };
 
@@ -862,26 +884,56 @@ async fn handle_get_extended_card(
 // SSE stream helper
 // ────────────────────────────────────────────────────────────────────────────
 
-/// True if this event moves the task into a terminal state.
-fn is_terminal_event(event: &StreamResponse) -> bool {
+/// How often an idle stream checks that its task still exists, so a stream
+/// on a task that was evicted for its TTL does not stay open.
+const STREAM_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// True if this event ends the stream: the task reached a terminal state or
+/// an interrupted one (input-required, auth-required) where it waits for
+/// the client.
+fn is_final_event(event: &StreamResponse) -> bool {
+    let state = match event {
+        StreamResponse::StatusUpdate(e) => &e.status.state,
+        StreamResponse::Task(t) => &t.status.state,
+        _ => return false,
+    };
+    state.is_terminal() || state.is_interrupted()
+}
+
+/// The task id an event belongs to, if it names one.
+fn event_task_id(event: &StreamResponse) -> Option<&str> {
     match event {
-        StreamResponse::StatusUpdate(e) => e.status.state.is_terminal(),
-        StreamResponse::Task(t) => t.status.state.is_terminal(),
-        _ => false,
+        StreamResponse::StatusUpdate(e) => Some(&e.task_id),
+        StreamResponse::ArtifactUpdate(e) => Some(&e.task_id),
+        StreamResponse::Task(t) => Some(&t.id),
+        StreamResponse::Message(m) => m.task_id.as_deref(),
     }
 }
 
-/// Turn a task's broadcast channel into an SSE stream that ends after the
-/// task reaches a terminal state, as A2A v1.0 requires.
+/// The current status of a task as a status update event.
+fn status_event(task: Task) -> StreamResponse {
+    StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task.id,
+        context_id: task.context_id.unwrap_or_default(),
+        status: task.status,
+        metadata: None,
+    })
+}
+
+/// Events for one task, ending after the event that moves it to a terminal
+/// or interrupted state.
 ///
-/// The stream also ends if the task is evicted from the store. If the
-/// receiver lags and may have missed the terminal update, the store is
-/// checked and the final status is sent before closing.
-fn make_sse_stream(
+/// The stream also ends when the task leaves the store: the channel closes
+/// on eviction, and an idle stream checks the store every
+/// [`STREAM_RECHECK_INTERVAL`] so a task that expired is noticed even if
+/// nothing else touched the store. If the receiver lagged past the final
+/// event, or the idle check finds the task terminal, the current status is
+/// sent before closing. Events for other tasks are dropped.
+fn task_event_stream(
     rx: broadcast::Receiver<StreamResponse>,
     store: Arc<dyn TaskStore>,
     task_id: String,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+) -> impl futures::Stream<Item = StreamResponse> + Send {
     struct StreamState {
         rx: broadcast::Receiver<StreamResponse>,
         store: Arc<dyn TaskStore>,
@@ -896,39 +948,59 @@ fn make_sse_stream(
         done: false,
     };
 
-    let events = futures::stream::unfold(init, |mut st| async move {
+    futures::stream::unfold(init, |mut st| async move {
         if st.done {
             return None;
         }
         loop {
-            match st.rx.recv().await {
-                Ok(event) => {
-                    st.done = is_terminal_event(&event);
+            let received = tokio::time::timeout(STREAM_RECHECK_INTERVAL, st.rx.recv()).await;
+            match received {
+                Ok(Ok(event)) => {
+                    if event_task_id(&event) != Some(st.task_id.as_str()) {
+                        continue;
+                    }
+                    st.done = is_final_event(&event);
                     return Some((event, st));
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!(lagged = n, "SSE client lagged behind");
+                Ok(Err(broadcast::error::RecvError::Closed)) => return None,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    // Events were dropped, maybe the final one: check the task.
                     match st.store.get(&st.task_id).await {
-                        Ok(Some(task)) if task.status.state.is_terminal() => {
+                        Ok(Some(task))
+                            if task.status.state.is_terminal()
+                                || task.status.state.is_interrupted() =>
+                        {
                             st.done = true;
-                            let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                                task_id: task.id,
-                                context_id: task.context_id.unwrap_or_default(),
-                                status: task.status,
-                                metadata: None,
-                            });
-                            return Some((event, st));
+                            return Some((status_event(task), st));
                         }
                         Ok(Some(_)) => continue,
                         _ => return None,
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(_) => {
+                    // Quiet for a while: end the stream if the task is gone
+                    // (evicted or expired) or already terminal.
+                    match st.store.get(&st.task_id).await {
+                        Ok(Some(task)) if task.status.state.is_terminal() => {
+                            st.done = true;
+                            return Some((status_event(task), st));
+                        }
+                        Ok(Some(_)) => continue,
+                        _ => return None,
+                    }
+                }
             }
         }
-    });
+    })
+}
 
-    let stream = futures::StreamExt::map(events, |event| {
+/// Serve [`task_event_stream`] as SSE, with keep-alives.
+fn make_sse_stream(
+    rx: broadcast::Receiver<StreamResponse>,
+    store: Arc<dyn TaskStore>,
+    task_id: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::StreamExt::map(task_event_stream(rx, store, task_id), |event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok(Event::default().data(json))
     });
@@ -1029,6 +1101,72 @@ mod tests {
             icon_url: None,
         });
         assert!(server.bind_addr.is_loopback());
+    }
+
+    fn bare_task(id: &str) -> Task {
+        Task {
+            id: id.into(),
+            context_id: Some("ctx".into()),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: vec![],
+            history: None,
+            metadata: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_stream_ends_when_its_task_expires() {
+        use crate::store::StoreLimits;
+        use futures::StreamExt;
+
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::with_limits(StoreLimits {
+            max_tasks: 10,
+            ttl: Some(std::time::Duration::from_secs(60)),
+        }));
+        store.insert(bare_task("t1"), None).await.unwrap();
+        let rx = store.subscribe("t1").await.unwrap();
+        let mut events = Box::pin(task_event_stream(rx, store.clone(), "t1".into()));
+
+        // Nothing else touches the store, so only the stream's own check can
+        // notice that the task expired.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(600), events.next())
+            .await
+            .expect("stream stayed open after its task expired");
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_ignores_events_for_other_tasks() {
+        use futures::StreamExt;
+
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let (tx, rx) = broadcast::channel(8);
+        let status = |id: &str, state| {
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: id.into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            })
+        };
+        tx.send(status("other", TaskState::Completed)).unwrap();
+        tx.send(status("t1", TaskState::Working)).unwrap();
+        tx.send(status("t1", TaskState::Completed)).unwrap();
+
+        let events: Vec<_> = task_event_stream(rx, store, "t1".into()).collect().await;
+        let ids: Vec<_> = events
+            .iter()
+            .map(|e| event_task_id(e).unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["t1", "t1"]);
     }
 
     #[test]

@@ -124,3 +124,32 @@ async fn stream_times_out_when_the_server_goes_quiet() {
     assert!(is_timeout(&next), "{next:?}");
     assert!(stream.next().await.is_none());
 }
+
+#[tokio::test]
+async fn stream_gives_up_on_an_event_that_never_ends() {
+    // 17 MB of data with no event delimiter.
+    let router = axum::Router::new().route(
+        "/",
+        post(|| async {
+            let body = "x".repeat(17 * 1024 * 1024);
+            ([("content-type", "text/event-stream")], body)
+        }),
+    );
+    let url = common::serve_router(router).await;
+    let client = A2aClient::new();
+
+    let mut stream = client.send_streaming(&url, send_request()).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("stream hung")
+        .expect("stream ended without reporting the oversized event");
+    assert!(
+        matches!(
+            first,
+            Err(A2aError::Transport(
+                A2aTransportError::InvalidResponse { .. }
+            ))
+        ),
+        "{first:?}"
+    );
+}

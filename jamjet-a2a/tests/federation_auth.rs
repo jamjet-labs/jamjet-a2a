@@ -34,6 +34,8 @@ fn policy() -> FederationPolicy {
             ),
             ("CancelTask".to_string(), vec!["write".to_string()]),
             ("GetTask".to_string(), vec!["read".to_string()]),
+            ("ListTasks".to_string(), vec!["read".to_string()]),
+            ("SubscribeToTask".to_string(), vec!["read".to_string()]),
         ]
         .into_iter()
         .collect(),
@@ -187,8 +189,11 @@ async fn policy_as_authenticator_binds_tasks_and_checks_scopes() {
 
 #[tokio::test]
 async fn optional_auth_still_rejects_bad_tokens() {
+    // No scope rules: an anonymous caller has no scopes, so any rule would
+    // refuse it.
     let policy = FederationPolicy {
         require_auth: false,
+        method_scopes: Default::default(),
         ..policy()
     };
     let url = serve(
@@ -202,4 +207,53 @@ async fn optional_auth_still_rejects_bad_tokens() {
     assert_eq!(status, 200);
     let (status, _) = rpc(&url, Some("tok-unknown"), "ListTasks", json!({})).await;
     assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn layer_enforces_scopes_on_streaming_and_unlisted_methods() {
+    let url = layered_server().await;
+    let ro = Some("tok-ro");
+
+    for method in ["SendStreamingMessage", "message/stream"] {
+        let (status, body) = rpc(
+            &url,
+            ro,
+            method,
+            json!({"message": message("m-1", "x", None, None)}),
+        )
+        .await;
+        assert_eq!(status, 403, "{method}: {body}");
+    }
+
+    // GetExtendedAgentCard has no entry in the policy, so it is refused.
+    let (status, body) = rpc(&url, Some("tok-alpha"), "GetExtendedAgentCard", json!({})).await;
+    assert_eq!(status, 403, "{body}");
+}
+
+#[tokio::test]
+async fn layer_and_authenticator_together() {
+    let router = A2aServer::new(agent_card())
+        .with_handler(HoldHandler)
+        .with_authenticator(policy())
+        .into_router()
+        .layer(middleware::from_fn_with_state(
+            policy(),
+            federation_auth_layer,
+        ));
+    let url = serve_router(router).await;
+
+    let (status, _) = rpc(&url, None, "ListTasks", json!({})).await;
+    assert_eq!(status, 401);
+    let (status, _) = rpc(
+        &url,
+        Some("tok-ro"),
+        "SendMessage",
+        json!({"message": message("m-1", "x", None, None)}),
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    let task_id = create_task(&url, Some("tok-alpha"), None).await;
+    let (_, body) = rpc(&url, Some("tok-beta"), "GetTask", json!({"id": task_id})).await;
+    assert_eq!(error_code(&body), Some(TASK_NOT_FOUND), "{body}");
 }
