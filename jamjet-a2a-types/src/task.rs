@@ -294,7 +294,10 @@ mod tests {
     #[test]
     fn role_serializes_to_proto_format() {
         assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"ROLE_USER\"");
-        assert_eq!(serde_json::to_string(&Role::Agent).unwrap(), "\"ROLE_AGENT\"");
+        assert_eq!(
+            serde_json::to_string(&Role::Agent).unwrap(),
+            "\"ROLE_AGENT\""
+        );
     }
 
     #[test]

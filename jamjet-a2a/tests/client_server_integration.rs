@@ -458,11 +458,15 @@ async fn agent_card_has_cors_headers() {
 
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap()),
         Some("*")
     );
     assert_eq!(
-        resp.headers().get("cache-control").map(|v| v.to_str().unwrap()),
+        resp.headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap()),
         Some("no-cache")
     );
 }
