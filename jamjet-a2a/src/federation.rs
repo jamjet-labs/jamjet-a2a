@@ -5,26 +5,38 @@
 //! - **mTLS configuration**: TLS settings for cross-org federation with
 //!   mutual certificate authentication.
 
+use crate::auth::{forbidden_response, unauthenticated_response, Authenticator, Principal};
+use crate::server::canonical_method;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Json, Response},
 };
 use jamjet_a2a_types::A2aError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{info, warn};
 
 // ── Federation auth policy ──────────────────────────────────────────────────
 
 /// Authorization policy for incoming A2A requests.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Use it either as the server's authenticator
+/// (`A2aServer::with_authenticator(policy)`), which also binds tasks to the
+/// caller, or as an Axum layer via [`federation_auth_layer`].
+///
+/// Authentication is required unless `require_auth` is explicitly set to
+/// `false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationPolicy {
-    /// If true, all incoming requests require a valid Bearer token.
-    #[serde(default)]
+    /// If true (the default), every request except the public Agent Card
+    /// needs a valid Bearer token. Setting it to false turns authentication
+    /// off and makes the server single-tenant.
+    #[serde(default = "default_true")]
     pub require_auth: bool,
 
     /// Allowed Bearer tokens mapped to their granted scopes.
@@ -39,10 +51,25 @@ pub struct FederationPolicy {
     #[serde(default)]
     pub allowed_agents: Vec<String>,
 
-    /// Scopes required per RPC method. Maps v1.0 method names
-    /// ("SendMessage", "GetTask", etc.) to required scopes.
+    /// Scopes required per RPC method. Maps method names to required
+    /// scopes; the caller needs at least one of them. Keys may use the v1.0
+    /// names ("SendMessage", "GetTask", ...) or the v0.3 aliases
+    /// ("message/send", ...); both spellings of a method are checked against
+    /// the same entry. Methods without an entry are allowed.
     #[serde(default)]
     pub method_scopes: HashMap<String, Vec<String>>,
+}
+
+impl Default for FederationPolicy {
+    fn default() -> Self {
+        Self {
+            require_auth: true,
+            tokens: Vec::new(),
+            public_agent_card: true,
+            allowed_agents: Vec::new(),
+            method_scopes: HashMap::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -54,7 +81,8 @@ fn default_true() -> bool {
 pub struct FederationToken {
     /// The token value (matched against Bearer header).
     pub token: String,
-    /// Human-readable name for audit logging.
+    /// Human-readable name for audit logging. Tokens without an `agent_id`
+    /// are bound to tasks by this name, so keep names unique.
     pub name: String,
     /// Agent ID of the token holder.
     pub agent_id: Option<String>,
@@ -72,6 +100,30 @@ pub struct FederationIdentity {
     pub agent_id: Option<String>,
     /// Granted scopes.
     pub scopes: HashSet<String>,
+}
+
+impl FederationIdentity {
+    /// The [`Principal`] tasks are bound to: `agent:<agent_id>` when the
+    /// token names an agent, otherwise `token:<token_name>`.
+    pub fn principal(&self) -> Principal {
+        let id = match &self.agent_id {
+            Some(agent) => format!("agent:{agent}"),
+            None => format!("token:{}", self.token_name),
+        };
+        Principal::new(id).with_scopes(self.scopes.iter().cloned())
+    }
+}
+
+/// Principal id used for unauthenticated callers when `require_auth` is
+/// false and the policy is used as an [`Authenticator`].
+pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
+
+/// Compare two byte strings without stopping at the first difference.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Validate a Bearer token against the federation policy.
@@ -92,13 +144,23 @@ pub fn validate_federation_token(
             reason: "authorization must be Bearer token".into(),
         })?;
 
-    let found = policy
-        .tokens
-        .iter()
-        .find(|t| t.token == token)
-        .ok_or_else(|| A2aError::Auth {
-            reason: "invalid token".into(),
-        })?;
+    if token.is_empty() {
+        return Err(A2aError::Auth {
+            reason: "empty bearer token".into(),
+        });
+    }
+
+    // Check every configured token so the time taken does not depend on
+    // which one (if any) matched.
+    let mut found = None;
+    for candidate in &policy.tokens {
+        if constant_time_eq(candidate.token.as_bytes(), token.as_bytes()) && found.is_none() {
+            found = Some(candidate);
+        }
+    }
+    let found = found.ok_or_else(|| A2aError::Auth {
+        reason: "invalid token".into(),
+    })?;
 
     // Check agent ID allowlist.
     if !policy.allowed_agents.is_empty() {
@@ -122,23 +184,71 @@ pub fn validate_federation_token(
     })
 }
 
+/// True if a caller holding `has_scope` may call `method` under `policy`.
+///
+/// Both the requested method and the policy keys are mapped to their v1.0
+/// names first, so `message/send` is held to the scopes configured for
+/// `SendMessage` and the other way round. If several keys name the same
+/// method, each of them must be satisfied.
+fn scopes_allow(policy: &FederationPolicy, method: &str, has_scope: impl Fn(&str) -> bool) -> bool {
+    let target = canonical_method(method).unwrap_or(method);
+    policy
+        .method_scopes
+        .iter()
+        .filter(|(key, _)| canonical_method(key).unwrap_or(key) == target)
+        .all(|(_, required)| required.is_empty() || required.iter().any(|s| has_scope(s)))
+}
+
 /// Check if an identity has the required scopes for a given RPC method.
 ///
-/// Method names use v1.0 convention: "SendMessage", "GetTask", etc.
+/// Accepts v1.0 names ("SendMessage", "GetTask", ...) and the v0.3 aliases
+/// the server serves ("message/send", ...).
 pub fn check_method_scopes(
     identity: &FederationIdentity,
     method: &str,
     policy: &FederationPolicy,
 ) -> bool {
-    if let Some(required) = policy.method_scopes.get(method) {
-        if required.is_empty() {
-            return true;
+    scopes_allow(policy, method, |s| identity.scopes.contains(s))
+}
+
+#[async_trait::async_trait]
+impl Authenticator for FederationPolicy {
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, A2aError> {
+        if !self.require_auth && !headers.contains_key("authorization") {
+            return Ok(Principal::new(ANONYMOUS_PRINCIPAL));
         }
-        required.iter().any(|s| identity.scopes.contains(s))
-    } else {
-        // No specific scope requirement for this method — allow.
-        true
+        // A presented token is always checked, even when auth is optional.
+        let identity = validate_federation_token(headers, self)?;
+        info!(
+            token_name = %identity.token_name,
+            agent_id = ?identity.agent_id,
+            "A2A federation auth: authorized"
+        );
+        Ok(identity.principal())
     }
+
+    fn authorize(&self, principal: &Principal, method: &str) -> bool {
+        scopes_allow(self, method, |s| principal.scopes.contains(s))
+    }
+}
+
+/// Agent Card paths served by `A2aServer`.
+const AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
+
+/// Largest JSON-RPC body the layer reads to find the method. Matches Axum's
+/// default body limit for the server's own extractor.
+const MAX_RPC_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+fn invalid_request_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32600, "message": "Invalid Request" }
+        })),
+    )
+        .into_response()
 }
 
 /// Axum middleware layer for federation auth.
@@ -148,6 +258,20 @@ pub fn check_method_scopes(
 /// use axum::middleware;
 /// router.layer(middleware::from_fn_with_state(policy, federation_auth_layer))
 /// ```
+///
+/// When `require_auth` is true (the default) the layer:
+///
+/// - lets `GET`/`HEAD` requests for the Agent Card through without a token
+///   if `public_agent_card` is set (exact path match only);
+/// - rejects requests without a valid Bearer token with HTTP 401;
+/// - reads the JSON-RPC body of `POST` requests and rejects methods the
+///   token lacks scopes for with HTTP 403, and bodies with no method with
+///   HTTP 400;
+/// - passes the caller's [`Principal`] to the server in the request
+///   extensions, so tasks are bound to the caller.
+///
+/// If the server also has its own authenticator, the server's authenticator
+/// decides and this layer's principal is ignored.
 pub async fn federation_auth_layer(
     axum::extract::State(policy): axum::extract::State<FederationPolicy>,
     request: Request<Body>,
@@ -155,8 +279,10 @@ pub async fn federation_auth_layer(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    // Allow public access to Agent Card if configured (v1.0 well-known path).
-    if policy.public_agent_card && path.contains(".well-known/agent-card.json") {
+    // Allow public access to the Agent Card if configured.
+    let card_request = matches!(*request.method(), Method::GET | Method::HEAD)
+        && AGENT_CARD_PATHS.contains(&path.as_str());
+    if policy.public_agent_card && card_request {
         return next.run(request).await;
     }
 
@@ -164,33 +290,60 @@ pub async fn federation_auth_layer(
         return next.run(request).await;
     }
 
-    match validate_federation_token(request.headers(), &policy) {
-        Ok(identity) => {
-            info!(
-                token_name = %identity.token_name,
-                agent_id = ?identity.agent_id,
-                path = %path,
-                "A2A federation auth: authorized"
-            );
-            next.run(request).await
-        }
+    let identity = match validate_federation_token(request.headers(), &policy) {
+        Ok(identity) => identity,
         Err(e) => {
             warn!(
                 error = %e,
                 path = %path,
                 "A2A federation auth: rejected"
             );
-            (
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32003, "message": e.to_string() }
-                })
-                .to_string(),
-            )
-                .into_response()
+            return unauthenticated_response();
+        }
+    };
+
+    // The method is in the JSON-RPC body: read it (bounded), check scopes,
+    // then hand the same bytes on.
+    let (mut parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_RPC_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+
+    if parts.method == Method::POST {
+        let rpc: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+        let method = rpc
+            .as_ref()
+            .and_then(|v| v.get("method"))
+            .and_then(|m| m.as_str());
+        let Some(method) = method else {
+            warn!(path = %path, "A2A federation auth: rejected request without a method");
+            return invalid_request_response();
+        };
+        if !check_method_scopes(&identity, method, &policy) {
+            warn!(
+                token_name = %identity.token_name,
+                method = %method,
+                "A2A federation auth: missing scope"
+            );
+            let id = rpc
+                .as_ref()
+                .and_then(|v| v.get("id"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            return forbidden_response(id, canonical_method(method).unwrap_or(method));
         }
     }
+
+    info!(
+        token_name = %identity.token_name,
+        agent_id = ?identity.agent_id,
+        path = %path,
+        "A2A federation auth: authorized"
+    );
+    parts.extensions.insert(identity.principal());
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 // ── mTLS configuration ──────────────────────────────────────────────────────
@@ -267,18 +420,30 @@ pub fn build_mtls_client(tls: &TlsConfig) -> Result<reqwest::Client, A2aError> {
         return Ok(reqwest::Client::new());
     }
 
+    // A configured CA that cannot be read is an error, not a silent fallback
+    // to the system roots.
+    let ca = match tls.ca_cert_path {
+        Some(_) => {
+            let ca_pem = tls.load_ca_cert()?;
+            Some(
+                reqwest::Certificate::from_pem(&ca_pem).map_err(|e| A2aError::Auth {
+                    reason: format!("invalid CA cert: {e}"),
+                })?,
+            )
+        }
+        None => None,
+    };
+
     let (cert_pem, key_pem) = tls.load_cert_key()?;
     let identity =
         reqwest::Identity::from_pkcs8_pem(&cert_pem, &key_pem).map_err(|e| A2aError::Auth {
             reason: format!("invalid identity PEM: {e}"),
         })?;
 
-    let mut builder = reqwest::Client::builder().identity(identity);
-
-    if let Ok(ca_pem) = tls.load_ca_cert() {
-        let ca = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| A2aError::Auth {
-            reason: format!("invalid CA cert: {e}"),
-        })?;
+    let mut builder = reqwest::Client::builder()
+        .identity(identity)
+        .connect_timeout(Duration::from_secs(10));
+    if let Some(ca) = ca {
         builder = builder.add_root_certificate(ca);
     }
 
@@ -374,6 +539,71 @@ mod tests {
 
         assert!(check_method_scopes(&identity, "SendMessage", &policy));
         assert!(check_method_scopes(&identity, "GetTask", &policy));
+    }
+
+    #[test]
+    fn policy_requires_auth_unless_turned_off() {
+        assert!(FederationPolicy::default().require_auth);
+        let parsed: FederationPolicy = serde_json::from_str("{}").unwrap();
+        assert!(parsed.require_auth);
+        let parsed: FederationPolicy = serde_json::from_str(r#"{"require_auth": false}"#).unwrap();
+        assert!(!parsed.require_auth);
+    }
+
+    #[test]
+    fn v03_alias_is_held_to_the_v1_scope() {
+        let policy = test_policy();
+        let identity =
+            validate_federation_token(&headers_with_token("tok-readonly"), &policy).unwrap();
+        // SendMessage needs "write"; its alias must too.
+        assert!(!check_method_scopes(&identity, "message/send", &policy));
+        assert!(check_method_scopes(&identity, "tasks/get", &policy));
+
+        // A scope configured under the alias applies to the v1.0 name.
+        let mut policy = test_policy();
+        policy.method_scopes = [("tasks/cancel".to_string(), vec!["admin".to_string()])]
+            .into_iter()
+            .collect();
+        assert!(!check_method_scopes(&identity, "CancelTask", &policy));
+    }
+
+    #[test]
+    fn empty_bearer_token_never_authenticates() {
+        let mut policy = test_policy();
+        policy.tokens.push(FederationToken {
+            token: String::new(),
+            name: "misconfigured".to_string(),
+            agent_id: Some("agent-empty".to_string()),
+            scopes: vec!["write".to_string()],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer "));
+        assert!(validate_federation_token(&headers, &policy).is_err());
+    }
+
+    #[test]
+    fn identity_principal_prefers_agent_id() {
+        let policy = test_policy();
+        let identity =
+            validate_federation_token(&headers_with_token("tok-alpha"), &policy).unwrap();
+        assert_eq!(identity.principal().id, "agent:agent-alpha");
+        let anonymous_agent = FederationIdentity {
+            token_name: "ci".into(),
+            agent_id: None,
+            scopes: HashSet::new(),
+        };
+        assert_eq!(anonymous_agent.principal().id, "token:ci");
+    }
+
+    #[test]
+    fn unreadable_ca_is_an_error_not_a_fallback() {
+        let tls = TlsConfig {
+            enabled: true,
+            ca_cert_path: Some(PathBuf::from("/nonexistent/jamjet-a2a-test-ca.pem")),
+            ..Default::default()
+        };
+        let err = build_mtls_client(&tls).unwrap_err();
+        assert!(err.to_string().contains("CA cert"), "{err}");
     }
 
     #[test]
