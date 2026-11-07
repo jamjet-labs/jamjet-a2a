@@ -179,7 +179,7 @@ impl TaskStore for InMemoryTaskStore {
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2aError> {
         let inner = self.inner.lock().await;
 
-        let page_size = req.page_size.unwrap_or(50).max(1).min(100) as usize;
+        let page_size = req.page_size.unwrap_or(50).clamp(1, 100) as usize;
         let history_length = req.history_length;
         let include_artifacts = req.include_artifacts.unwrap_or(false);
 
@@ -269,13 +269,12 @@ impl TaskStore for InMemoryTaskStore {
         let actual_count = page.len() as i32;
 
         // Determine next_page_token: empty string means no more results.
-        let next_page_token = if page.len() == page_size
-            && start_idx + page_size < total_size as usize
-        {
-            page.last().map(|t| t.id.clone()).unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let next_page_token =
+            if page.len() == page_size && start_idx + page_size < total_size as usize {
+                page.last().map(|t| t.id.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
 
         // pageSize in response = actual number of tasks returned (capped by request).
         Ok(ListTasksResponse {

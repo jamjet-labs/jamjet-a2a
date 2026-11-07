@@ -260,7 +260,10 @@ async fn jsonrpc_handler(
 
     // Step 5: Extract id and params.
     let rpc_id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let params = body.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    let params = body
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let rpc = IncomingRpc {
         jsonrpc: "2.0".to_string(),
