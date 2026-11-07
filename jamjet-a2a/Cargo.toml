@@ -13,7 +13,7 @@ categories = ["network-programming", "web-programming"]
 [features]
 default = ["client", "server"]
 client = ["dep:reqwest", "dep:futures"]
-server = ["dep:axum", "dep:tokio-stream", "dep:chrono", "dep:uuid"]
+server = ["dep:axum", "dep:futures", "dep:chrono", "dep:uuid"]
 federation = ["server", "dep:reqwest"]
 coordinator = ["client"]
 mcp-bridge = []
@@ -31,12 +31,11 @@ thiserror = { workspace = true }
 reqwest = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 reqwest = { workspace = true }
 axum = { workspace = true }
 async-trait = { workspace = true }

@@ -37,6 +37,12 @@ pub enum A2aProtocolError {
 
     #[error("version not supported: {version}")]
     VersionNotSupported { version: String },
+
+    /// The task is in a terminal state (completed, failed, canceled or
+    /// rejected) and cannot accept further messages, updates or
+    /// subscriptions. A2A v1.0 reports this as `UnsupportedOperationError`.
+    #[error("task {task_id} is in a terminal state and cannot be changed")]
+    TaskTerminal { task_id: String },
 }
 
 impl A2aProtocolError {
@@ -52,6 +58,7 @@ impl A2aProtocolError {
             Self::ExtendedCardNotConfigured => -32007,
             Self::ExtensionRequired { .. } => -32008,
             Self::VersionNotSupported { .. } => -32009,
+            Self::TaskTerminal { .. } => -32004,
         }
     }
 
@@ -93,6 +100,26 @@ pub enum A2aTransportError {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// A2aStoreError
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Errors raised by a task store. These are server-side conditions, not A2A
+/// protocol errors, and a server reports them as JSON-RPC internal errors.
+#[derive(Debug, Clone, Error)]
+#[non_exhaustive]
+pub enum A2aStoreError {
+    /// A task with this id already exists. Stores must never replace an
+    /// existing task on insert.
+    #[error("task already exists: {task_id}")]
+    TaskAlreadyExists { task_id: String },
+
+    /// The store holds its maximum number of live tasks and none could be
+    /// evicted.
+    #[error("task store is full ({capacity} tasks)")]
+    CapacityExceeded { capacity: usize },
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // A2aError
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -108,6 +135,9 @@ pub enum A2aError {
 
     #[error("unauthorized: {reason}")]
     Auth { reason: String },
+
+    #[error(transparent)]
+    Store(#[from] A2aStoreError),
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -138,6 +168,12 @@ mod tests {
             A2aProtocolError::PushNotificationNotSupported.json_rpc_code(),
             -32003
         );
+        // Terminal-state rejections use UnsupportedOperationError's code.
+        let terminal = A2aProtocolError::TaskTerminal {
+            task_id: "x".into(),
+        };
+        assert_eq!(terminal.json_rpc_code(), -32004);
+        assert_eq!(terminal.http_status(), 400);
     }
 
     #[test]
