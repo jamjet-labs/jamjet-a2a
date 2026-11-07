@@ -201,6 +201,7 @@ pub struct A2aServer {
     header_read_timeout: Duration,
     body_read_timeout: Duration,
     max_streams_per_caller: usize,
+    max_connections: usize,
 }
 
 impl A2aServer {
@@ -216,7 +217,18 @@ impl A2aServer {
             header_read_timeout: Self::DEFAULT_HEADER_READ_TIMEOUT,
             body_read_timeout: Self::DEFAULT_BODY_READ_TIMEOUT,
             max_streams_per_caller: Self::DEFAULT_MAX_STREAMS_PER_CALLER,
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
         }
+    }
+
+    /// Default number of open connections: 1,024.
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+
+    /// How many connections [`serve`](Self::serve) keeps open at once. Keep
+    /// it below the process's file descriptor limit.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max.max(1);
+        self
     }
 
     /// Default time a client has to send the request headers: 30 s.
@@ -226,10 +238,12 @@ impl A2aServer {
     /// Default number of SSE streams one caller may hold open: 100.
     pub const DEFAULT_MAX_STREAMS_PER_CALLER: usize = 100;
 
-    /// How long a client may take to send the request headers before the
-    /// connection is closed. Applies to [`start`](Self::start) and
-    /// [`serve`](Self::serve); with [`into_router`](Self::into_router) the
-    /// HTTP server you run it on decides.
+    /// How long a client may take to send the request headers, including
+    /// the first byte of a new connection and the next request on a
+    /// keep-alive connection, before the connection is closed. Applies to
+    /// [`start`](Self::start) and [`serve`](Self::serve); with
+    /// [`into_router`](Self::into_router) the HTTP server you run it on
+    /// decides.
     pub fn with_header_read_timeout(mut self, timeout: Duration) -> Self {
         self.header_read_timeout = timeout;
         self
@@ -316,7 +330,7 @@ impl A2aServer {
     }
 
     /// Start the server, binding to the configured address and port
-    /// (default `127.0.0.1:3000`).
+    /// (default `127.0.0.1:3000`). See [`serve`](Self::serve).
     pub async fn start(self) -> Result<(), A2aError> {
         let addr = SocketAddr::new(self.bind_addr, self.port);
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -328,11 +342,34 @@ impl A2aServer {
         self.serve(listener).await
     }
 
-    /// Serve on an already bound listener. Runs until the listener fails.
+    /// Serve HTTP/1.1 on an already bound listener until the listener fails.
     ///
-    /// Each connection gets the header read timeout set with
-    /// [`with_header_read_timeout`](Self::with_header_read_timeout).
+    /// - Each connection must send its request headers within the header
+    ///   read timeout, also when it sends nothing at all and between
+    ///   keep-alive requests. HTTP/2 is not served; a client that opens with
+    ///   the HTTP/2 preface is closed.
+    /// - At most [`with_max_connections`](Self::with_max_connections)
+    ///   connections are open at once; further clients wait in the listen
+    ///   backlog until one closes.
+    /// - Accept errors from running out of file descriptors or memory are
+    ///   retried with a growing delay (up to 1 s). Per-connection errors are
+    ///   skipped. Any other listener error ends `serve` with an error.
     pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), A2aError> {
+        self.serve_with_shutdown(listener, std::future::pending())
+            .await
+    }
+
+    /// Like [`serve`](Self::serve), but stops when `shutdown` completes.
+    ///
+    /// On shutdown the server stops accepting, asks open connections to
+    /// finish their current request, waits up to 10 s for them, and returns
+    /// `Ok(())`. Long-lived streams that are still open after that are left
+    /// to end with the runtime.
+    pub async fn serve_with_shutdown(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<(), A2aError> {
         let addr = listener
             .local_addr()
             .map_err(|e| A2aTransportError::Connection {
@@ -348,35 +385,100 @@ impl A2aServer {
             );
         }
         let header_read_timeout = self.header_read_timeout;
+        let connections = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let router = self.into_router();
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
         info!(addr = %addr, "starting A2A server");
 
+        tokio::pin!(shutdown);
+        let mut backoff = Duration::ZERO;
         loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // Usually out of file descriptors; back off and retry.
-                    warn!(error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for a free connection slot before accepting.
+            let permit = tokio::select! {
+                permit = Arc::clone(&connections).acquire_owned() => {
+                    permit.expect("connection semaphore is never closed")
+                }
+                () = &mut shutdown => break,
+            };
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                () = &mut shutdown => break,
+            };
+            let stream = match accepted {
+                Ok((stream, _peer)) => {
+                    backoff = Duration::ZERO;
+                    stream
+                }
+                Err(e) if is_connection_error(&e) => continue,
+                Err(e) if is_resource_error(&e) => {
+                    backoff =
+                        (backoff * 2).clamp(Duration::from_millis(10), Duration::from_secs(1));
+                    warn!(error = %e, delay = ?backoff, "accept failed, backing off");
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
+                Err(e) => {
+                    error!(error = %e, "accept failed, stopping the server");
+                    return Err(A2aTransportError::Connection {
+                        url: addr.to_string(),
+                        source: Box::new(e),
+                    }
+                    .into());
+                }
             };
+
             let service = hyper_util::service::TowerToHyperService::new(router.clone());
+            let watcher = graceful.watcher();
             tokio::spawn(async move {
+                let _permit = permit;
                 let mut builder = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
-                );
+                )
+                .http1_only();
                 builder
                     .http1()
                     .timer(hyper_util::rt::TokioTimer::new())
                     .header_read_timeout(header_read_timeout);
                 let io = hyper_util::rt::TokioIo::new(stream);
-                if let Err(e) = builder.serve_connection(io, service).await {
+                let conn = builder.serve_connection(io, service);
+                if let Err(e) = watcher.watch(conn).await {
                     debug!(error = %e, "connection ended with an error");
                 }
             });
         }
+
+        info!(addr = %addr, "A2A server shutting down");
+        drop(listener);
+        if tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown())
+            .await
+            .is_err()
+        {
+            warn!("connections still open after the shutdown grace period");
+        }
+        Ok(())
     }
+}
+
+/// How long [`A2aServer::serve_with_shutdown`] waits for open connections.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Accept errors that only concern the one incoming connection.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Accept errors from running out of descriptors or memory, which pass.
+fn is_resource_error(e: &std::io::Error) -> bool {
+    // EMFILE, ENFILE, ENOMEM, ENOBUFS (Linux 105, BSD/macOS 55).
+    matches!(e.raw_os_error(), Some(24 | 23 | 12 | 105 | 55))
+        || e.kind() == std::io::ErrorKind::OutOfMemory
 }
 
 /// True when the server would accept connections from other hosts with no
@@ -684,9 +786,32 @@ fn spawn_handler(state: &ServerState, task_id: String, message: Message, new_tas
             }
         }
 
-        let Some(ref h) = *handler else { return };
-        if let Err(e) = h.handle(task_id.clone(), message, store.clone()).await {
-            error!(task_id = %task_id, error = %e, "handler failed");
+        // Run the handler in its own task so a panic is caught (as a
+        // JoinError) and the task is marked failed instead of staying in
+        // Working forever.
+        let run = {
+            let handler = Arc::clone(&handler);
+            let store = Arc::clone(&store);
+            let task_id = task_id.clone();
+            tokio::spawn(async move {
+                match &*handler {
+                    Some(h) => h.handle(task_id, message, store).await,
+                    None => Ok(()),
+                }
+            })
+        };
+        let failure = match run.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => {
+                error!(task_id = %task_id, error = %e, "handler failed");
+                Some(format!("Handler error: {e}"))
+            }
+            Err(e) => {
+                error!(task_id = %task_id, error = %e, "handler panicked");
+                Some("Handler error: the handler panicked".to_string())
+            }
+        };
+        if let Some(text) = failure {
             let failed_status = TaskStatus {
                 state: TaskState::Failed,
                 message: Some(Message {
@@ -695,7 +820,7 @@ fn spawn_handler(state: &ServerState, task_id: String, message: Message, new_tas
                     task_id: Some(task_id.clone()),
                     role: Role::Agent,
                     parts: vec![Part {
-                        content: PartContent::Text(format!("Handler error: {e}")),
+                        content: PartContent::Text(text),
                         metadata: None,
                         filename: None,
                         media_type: None,
@@ -839,9 +964,9 @@ async fn handle_list_tasks(
     // the token cannot be used to probe for them.
     if let Some(ref token) = req.page_token {
         if !token.is_empty() {
-            match visible_task(&*state.store, token, owner.as_deref()).await {
-                Ok(_) => {}
-                Err(A2aError::Protocol(A2aProtocolError::TaskNotFound { .. })) => {
+            match state.store.is_visible(token, owner.as_deref()).await {
+                Ok(true) => {}
+                Ok(false) => {
                     return make_json_rpc_error_response(
                         rpc.id,
                         -32602,
@@ -871,13 +996,31 @@ async fn handle_list_tasks(
     match state.store.list(&req, owner.as_deref()).await {
         Ok(mut resp) => {
             // Do not rely on a custom store's filtering alone: drop anything
-            // that is not the caller's.
-            let mut visible = Vec::with_capacity(resp.tasks.len());
+            // that is not the caller's. If the store got it wrong, its
+            // totalSize and nextPageToken cannot be trusted either.
+            let listed = resp.tasks.len();
+            let mut visible = Vec::with_capacity(listed);
             for task in resp.tasks {
-                match state.store.get_record(&task.id).await {
-                    Ok(Some(rec)) if rec.owner.as_deref() == owner.as_deref() => visible.push(task),
-                    _ => error!(task_id = %task.id, "store listed a task the caller does not own"),
+                if matches!(
+                    state.store.is_visible(&task.id, owner.as_deref()).await,
+                    Ok(true)
+                ) {
+                    visible.push(task);
+                } else {
+                    error!(task_id = %task.id, "store listed a task the caller does not own");
                 }
+            }
+            let token_ok = resp.next_page_token.is_empty()
+                || matches!(
+                    state
+                        .store
+                        .is_visible(&resp.next_page_token, owner.as_deref())
+                        .await,
+                    Ok(true)
+                );
+            if visible.len() != listed || !token_ok {
+                resp.total_size = visible.len() as i32;
+                resp.next_page_token = String::new();
             }
             resp.page_size = visible.len() as i32;
             resp.tasks = visible;
@@ -898,8 +1041,13 @@ async fn handle_cancel_task(
     };
 
     let task_id = req.id.clone();
-    if let Err(e) = visible_task(&*state.store, &task_id, owner.as_deref()).await {
-        return make_error_response(rpc.id, e).into_response();
+    match state.store.is_visible(&task_id, owner.as_deref()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id })
+                .into_response()
+        }
+        Err(e) => return make_error_response(rpc.id, e).into_response(),
     }
     match state.store.cancel(&task_id).await {
         Ok(()) => {
@@ -1237,8 +1385,9 @@ fn make_error_response(
         A2aError::Protocol(ref proto) => {
             make_json_rpc_error_response(id, proto.json_rpc_code(), &error.to_string(), None)
         }
-        // A2A 3.4.1: a contextId the agent cannot accept is a request error.
-        A2aError::Store(A2aStoreError::ContextInUse { .. }) => {
+        // Too many messages on one task is a problem with the request, not
+        // a server fault.
+        A2aError::Store(A2aStoreError::HistoryFull { .. }) => {
             make_json_rpc_error_response(id, -32602, &format!("Invalid params: {error}"), None)
         }
         _ => make_json_rpc_error_response(id, -32603, &error.to_string(), None),

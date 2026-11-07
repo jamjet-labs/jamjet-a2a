@@ -736,7 +736,7 @@ async fn slow_request_headers_close_the_connection() {
 }
 
 #[tokio::test]
-async fn context_id_of_another_caller_is_refused() {
+async fn same_context_id_for_two_callers_is_independent() {
     let url = serve(
         A2aServer::new(agent_card())
             .with_handler(HoldHandler)
@@ -744,14 +744,21 @@ async fn context_id_of_another_caller_is_refused() {
     )
     .await;
     create_task(&url, Some("alice-token"), Some("ctx-shared")).await;
+    // Bob can use the same contextId: no error, so no hint that alice uses it.
+    let bob_task = create_task(&url, Some("bob-token"), Some("ctx-shared")).await;
     let (_, body) = rpc(
         &url,
         Some("bob-token"),
-        "SendMessage",
-        json!({"message": message("b-1", "x", None, Some("ctx-shared"))}),
+        "ListTasks",
+        json!({"contextId": "ctx-shared"}),
     )
     .await;
-    assert_eq!(error_code(&body), Some(INVALID_PARAMS), "{body}");
+    assert_eq!(body["result"]["totalSize"], 1, "{body}");
+    assert_eq!(
+        body["result"]["tasks"][0]["id"],
+        bob_task.as_str(),
+        "{body}"
+    );
 }
 
 /// A store whose `list` ignores the caller and always returns alice's tasks.
@@ -805,6 +812,175 @@ async fn server_drops_other_callers_tasks_from_a_leaky_list() {
     )
     .await;
     create_task(&url, Some("alice-token"), None).await;
-    let (_, body) = rpc(&url, Some("bob-token"), "ListTasks", json!({})).await;
-    assert_eq!(body["result"]["tasks"], json!([]), "{body}");
+    create_task(&url, Some("alice-token"), None).await;
+    let (_, body) = rpc(&url, Some("bob-token"), "ListTasks", json!({"pageSize": 1})).await;
+    let result = &body["result"];
+    assert_eq!(result["tasks"], json!([]), "{body}");
+    // Neither the count nor the cursor of alice's list may come through.
+    assert_eq!(result["totalSize"], 0, "{body}");
+    assert_eq!(result["nextPageToken"], "", "{body}");
+}
+
+// ── final review ────────────────────────────────────────────────────────────
+
+async fn served(server: A2aServer) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(server.serve(listener));
+    url
+}
+
+/// Connect, send `bytes`, and report whether the server closed the
+/// connection within `wait`.
+async fn closed_within(url: &str, bytes: &[u8], wait: Duration) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = url.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    if !bytes.is_empty() {
+        s.write_all(bytes).await.unwrap();
+    }
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, s.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn silent_http2_and_idle_connections_are_closed() {
+    let url = served(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_header_read_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    let wait = Duration::from_secs(3);
+
+    assert!(
+        closed_within(&url, b"", wait).await,
+        "silent client kept open"
+    );
+    assert!(
+        closed_within(&url, b"PRI * HTTP/2.0\r\n", wait).await,
+        "HTTP/2 preface prefix kept open"
+    );
+    let mut h2 = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    h2.extend_from_slice(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0]);
+    assert!(
+        closed_within(&url, &h2, wait).await,
+        "HTTP/2 client kept open"
+    );
+    // A finished keep-alive request, then nothing.
+    assert!(
+        closed_within(
+            &url,
+            b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: t\r\n\r\n",
+            wait
+        )
+        .await,
+        "idle keep-alive connection kept open"
+    );
+}
+
+#[tokio::test]
+async fn connection_cap_holds_extra_clients_back() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = served(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_max_connections(1)
+            .with_header_read_timeout(Duration::from_secs(30)),
+    )
+    .await;
+    let addr = url.trim_start_matches("http://").to_string();
+
+    // The first connection takes the only slot and says nothing.
+    let first = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    second
+        .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let early = tokio::time::timeout(Duration::from_millis(500), second.read(&mut buf)).await;
+    assert!(early.is_err(), "second connection was served past the cap");
+
+    drop(first);
+    let n = tokio::time::timeout(Duration::from_secs(3), second.read(&mut buf))
+        .await
+        .expect("second connection never served after the slot freed")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+}
+
+#[tokio::test]
+async fn serve_with_shutdown_returns_when_signalled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .serve_with_shutdown(listener, async {
+                let _ = rx.await;
+            }),
+    );
+    create_task(&url, None, None).await;
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server did not stop after the shutdown signal")
+        .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// Panics on every message.
+struct PanicHandler;
+
+#[async_trait::async_trait]
+impl jamjet_a2a::server::TaskHandler for PanicHandler {
+    async fn handle(
+        &self,
+        _task_id: String,
+        _message: Message,
+        _store: std::sync::Arc<dyn jamjet_a2a::store::TaskStore>,
+    ) -> Result<(), A2aError> {
+        panic!("handler bug");
+    }
+}
+
+#[tokio::test]
+async fn handler_panic_marks_the_task_failed() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(PanicHandler)).await;
+    let task_id = create_task(&url, None, None).await;
+    wait_for_state(&url, None, &task_id, "TASK_STATE_FAILED").await;
+}
+
+#[tokio::test]
+async fn full_history_is_a_request_error() {
+    let store = jamjet_a2a::store::InMemoryTaskStore::with_limits(jamjet_a2a::store::StoreLimits {
+        max_history_messages: 1,
+        ..Default::default()
+    });
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_store(store),
+    )
+    .await;
+    let task_id = create_task(&url, None, None).await;
+    let (_, body) = rpc(
+        &url,
+        None,
+        "SendMessage",
+        json!({"message": message("m-2", "more", Some(&task_id), None)}),
+    )
+    .await;
+    assert_eq!(error_code(&body), Some(INVALID_PARAMS), "{body}");
 }
