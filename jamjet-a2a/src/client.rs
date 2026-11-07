@@ -12,24 +12,71 @@ use tracing::{debug, info};
 ///
 /// Wraps [`reqwest::Client`] (which is `Arc`-backed), so cloning is cheap.
 ///
+/// Every call is bounded in time. Unary calls (`send_message`, `get_task`,
+/// `discover`, ...) fail with [`A2aTransportError::Timeout`] after the
+/// request timeout (default 60 s). Streaming calls must receive response
+/// headers within the request timeout, and then fail if no bytes arrive for
+/// the stream idle timeout (default 5 min).
+///
 /// ```rust
 /// use jamjet_a2a::A2aClient;
+/// use std::time::Duration;
 ///
-/// let client = A2aClient::new().with_token("my-bearer-token");
+/// let client = A2aClient::new()
+///     .with_token("my-bearer-token")
+///     .with_request_timeout(Duration::from_secs(30));
 /// ```
 #[derive(Clone)]
 pub struct A2aClient {
     http: reqwest::Client,
     pub(crate) bearer_token: Option<String>,
+    request_timeout: Duration,
+    stream_idle_timeout: Duration,
 }
 
 impl A2aClient {
-    /// Create a new client with a default `reqwest::Client` and no bearer token.
+    /// Connect timeout of the HTTP client built by [`A2aClient::new`].
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Default limit for a whole unary request, and for the response headers
+    /// of a streaming request.
+    pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Default longest gap between bytes on an open stream.
+    pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Create a new client with the default timeouts and no bearer token.
     pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Self::DEFAULT_CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self::from_http_client(http)
+    }
+
+    /// Create a client on top of an existing `reqwest::Client`, for example
+    /// one built by `federation::build_mtls_client`.
+    ///
+    /// The request and stream idle timeouts still apply; connection settings
+    /// such as the connect timeout come from `http`.
+    pub fn from_http_client(http: reqwest::Client) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http,
             bearer_token: None,
+            request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
+            stream_idle_timeout: Self::DEFAULT_STREAM_IDLE_TIMEOUT,
         }
+    }
+
+    /// Set the limit for a whole unary request, and for the response headers
+    /// of a streaming request.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the longest gap allowed between bytes on an open stream.
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
     }
 
     /// Attach a bearer token for authenticated requests.
@@ -49,6 +96,41 @@ impl A2aClient {
             builder = builder.bearer_auth(token);
         }
         builder
+    }
+
+    /// Map a reqwest error, reporting timeouts as [`A2aTransportError::Timeout`].
+    fn transport_error(&self, url: &str, e: reqwest::Error) -> A2aError {
+        if e.is_timeout() {
+            A2aTransportError::Timeout {
+                url: url.to_string(),
+                duration: self.request_timeout,
+            }
+            .into()
+        } else {
+            A2aTransportError::Connection {
+                url: url.to_string(),
+                source: Box::new(e),
+            }
+            .into()
+        }
+    }
+
+    /// Send a streaming request, waiting at most the request timeout for the
+    /// response headers.
+    async fn send_for_stream(
+        &self,
+        url: &str,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, A2aError> {
+        match tokio::time::timeout(self.request_timeout, builder.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(self.transport_error(url, e)),
+            Err(_) => Err(A2aTransportError::Timeout {
+                url: url.to_string(),
+                duration: self.request_timeout,
+            }
+            .into()),
+        }
     }
 
     /// Map a JSON-RPC error code to the corresponding [`A2aProtocolError`].
@@ -121,13 +203,11 @@ impl A2aClient {
 
         let response = self
             .authed_request(reqwest::Method::POST, &url)
+            .timeout(self.request_timeout)
             .json(&rpc_request)
             .send()
             .await
-            .map_err(|e| A2aTransportError::Connection {
-                url: url.clone(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| self.transport_error(&url, e))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -136,12 +216,16 @@ impl A2aClient {
             });
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| A2aTransportError::InvalidResponse {
-                details: format!("failed to read response body: {e}"),
-            })?;
+        let body = response.text().await.map_err(|e| {
+            if e.is_timeout() {
+                self.transport_error(&url, e)
+            } else {
+                A2aTransportError::InvalidResponse {
+                    details: format!("failed to read response body: {e}"),
+                }
+                .into()
+            }
+        })?;
 
         let rpc_response: JsonRpcResponse<R> =
             serde_json::from_str(&body).map_err(|e| A2aTransportError::InvalidResponse {
@@ -176,12 +260,10 @@ impl A2aClient {
 
         let response = self
             .authed_request(reqwest::Method::GET, &url)
+            .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|e| A2aTransportError::Connection {
-                url: url.clone(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| self.transport_error(&url, e))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -198,10 +280,14 @@ impl A2aClient {
         }
 
         response.json::<AgentCard>().await.map_err(|e| {
-            A2aTransportError::InvalidResponse {
-                details: format!("failed to parse agent card: {e}"),
+            if e.is_timeout() {
+                self.transport_error(&url, e)
+            } else {
+                A2aTransportError::InvalidResponse {
+                    details: format!("failed to parse agent card: {e}"),
+                }
+                .into()
             }
-            .into()
         })
     }
 
@@ -238,15 +324,10 @@ impl A2aClient {
         let rpc_request = JsonRpcRequest::new("SendStreamingMessage", req);
         debug!(url = %url, "sending streaming message");
 
-        let response = self
+        let builder = self
             .authed_request(reqwest::Method::POST, &url)
-            .json(&rpc_request)
-            .send()
-            .await
-            .map_err(|e| A2aTransportError::Connection {
-                url: url.clone(),
-                source: Box::new(e),
-            })?;
+            .json(&rpc_request);
+        let response = self.send_for_stream(&url, builder).await?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -262,7 +343,7 @@ impl A2aClient {
             .into());
         }
 
-        Ok(parse_sse_stream(response))
+        Ok(parse_sse_stream(response, url, self.stream_idle_timeout))
     }
 
     /// Retrieve a task by ID.
@@ -304,15 +385,10 @@ impl A2aClient {
         );
         debug!(url = %url, task_id, "subscribing to task");
 
-        let response = self
+        let builder = self
             .authed_request(reqwest::Method::POST, &url)
-            .json(&rpc_request)
-            .send()
-            .await
-            .map_err(|e| A2aTransportError::Connection {
-                url: url.clone(),
-                source: Box::new(e),
-            })?;
+            .json(&rpc_request);
+        let response = self.send_for_stream(&url, builder).await?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -328,7 +404,7 @@ impl A2aClient {
             .into());
         }
 
-        Ok(parse_sse_stream(response))
+        Ok(parse_sse_stream(response, url, self.stream_idle_timeout))
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -455,48 +531,87 @@ impl Default for A2aClient {
 
 /// Parse an SSE byte stream into a stream of [`StreamResponse`] events.
 ///
-/// TCP chunks are NOT aligned to SSE event boundaries, so we buffer across
-/// chunks and split on the `\n\n` delimiter.
+/// TCP chunks are NOT aligned to SSE event boundaries, so we buffer bytes
+/// across chunks and split on the `\n\n` delimiter before decoding. The
+/// stream ends with [`A2aTransportError::Timeout`] if no bytes arrive for
+/// `idle_timeout`.
 fn parse_sse_stream(
     response: reqwest::Response,
-) -> impl futures::Stream<Item = Result<StreamResponse, A2aError>> {
+    url: String,
+    idle_timeout: Duration,
+) -> impl futures::Stream<Item = Result<StreamResponse, A2aError>> + Send + Unpin {
     use futures::StreamExt;
-    use std::sync::{Arc, Mutex};
+    use std::collections::VecDeque;
 
-    let buffer = Arc::new(Mutex::new(String::new()));
+    struct SseState<S> {
+        body: S,
+        buf: Vec<u8>,
+        pending: VecDeque<Result<StreamResponse, A2aError>>,
+        done: bool,
+        url: String,
+        idle_timeout: Duration,
+    }
 
-    response.bytes_stream().flat_map(move |chunk_result| {
-        let buffer = Arc::clone(&buffer);
-        let events: Vec<Result<StreamResponse, A2aError>> = match chunk_result {
-            Err(e) => vec![Err(A2aTransportError::SseError {
-                details: e.to_string(),
-            }
-            .into())],
-            Ok(chunk) => {
-                let text = String::from_utf8_lossy(&chunk);
-                let mut buf = buffer.lock().unwrap();
-                buf.push_str(&text);
-                let mut results = Vec::new();
-                while let Some(pos) = buf.find("\n\n") {
-                    let event_block = buf[..pos].to_string();
-                    *buf = buf[pos + 2..].to_string();
-                    for line in event_block.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            match serde_json::from_str::<StreamResponse>(data) {
-                                Ok(event) => results.push(Ok(event)),
-                                Err(e) => results.push(Err(A2aTransportError::InvalidResponse {
-                                    details: format!("SSE parse error: {e}"),
-                                }
-                                .into())),
+    fn drain_events<S>(st: &mut SseState<S>) {
+        while let Some(pos) = st.buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = st.buf.drain(..pos + 2).collect();
+            let text = String::from_utf8_lossy(&block[..pos]);
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    st.pending
+                        .push_back(serde_json::from_str::<StreamResponse>(data).map_err(|e| {
+                            A2aTransportError::InvalidResponse {
+                                details: format!("SSE parse error: {e}"),
                             }
-                        }
-                    }
+                            .into()
+                        }));
                 }
-                results
             }
-        };
-        futures::stream::iter(events)
+        }
+    }
+
+    let init = SseState {
+        body: response.bytes_stream().boxed(),
+        buf: Vec::new(),
+        pending: VecDeque::new(),
+        done: false,
+        url,
+        idle_timeout,
+    };
+
+    futures::stream::unfold(init, |mut st| async move {
+        loop {
+            if let Some(item) = st.pending.pop_front() {
+                return Some((item, st));
+            }
+            if st.done {
+                return None;
+            }
+            match tokio::time::timeout(st.idle_timeout, st.body.next()).await {
+                Err(_) => {
+                    st.done = true;
+                    st.pending.push_back(Err(A2aTransportError::Timeout {
+                        url: st.url.clone(),
+                        duration: st.idle_timeout,
+                    }
+                    .into()));
+                }
+                Ok(None) => st.done = true,
+                Ok(Some(Err(e))) => {
+                    st.done = true;
+                    st.pending.push_back(Err(A2aTransportError::SseError {
+                        details: e.to_string(),
+                    }
+                    .into()));
+                }
+                Ok(Some(Ok(chunk))) => {
+                    st.buf.extend_from_slice(&chunk);
+                    drain_events(&mut st);
+                }
+            }
+        }
     })
+    .boxed()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -524,6 +639,21 @@ mod tests {
     fn client_default() {
         let client = A2aClient::default();
         assert!(client.bearer_token.is_none());
+    }
+
+    #[test]
+    fn client_has_bounded_timeouts_by_default() {
+        let client = A2aClient::new();
+        assert_eq!(client.request_timeout, A2aClient::DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(
+            client.stream_idle_timeout,
+            A2aClient::DEFAULT_STREAM_IDLE_TIMEOUT
+        );
+        let client = client
+            .with_request_timeout(Duration::from_secs(5))
+            .with_stream_idle_timeout(Duration::from_secs(7));
+        assert_eq!(client.request_timeout, Duration::from_secs(5));
+        assert_eq!(client.stream_idle_timeout, Duration::from_secs(7));
     }
 
     #[test]
