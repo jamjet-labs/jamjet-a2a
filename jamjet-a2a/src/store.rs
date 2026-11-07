@@ -35,6 +35,8 @@ pub struct TaskRecord {
 ///   terminal, `update_status`, `add_artifact` and `append_message` return
 ///   [`A2aProtocolError::TaskTerminal`] and change nothing. The check and the
 ///   write must be atomic.
+/// - `insert` refuses a task whose `contextId` is already used by a task of
+///   a different owner, with [`A2aStoreError::ContextInUse`].
 /// - `list` returns only the tasks whose owner equals the `owner` argument.
 ///   The server validates a `pageToken` by looking it up as a task id, so
 ///   cursors must be task ids.
@@ -101,30 +103,57 @@ pub trait TaskStore: Send + Sync {
 const CHANNEL_CAPACITY: usize = 64;
 
 /// Size and age limits for [`InMemoryTaskStore`].
+///
+/// Capacity is enforced per owner first, then globally. When either limit is
+/// reached, the store evicts the least recently updated *terminal* task of
+/// the caller that is inserting; it never evicts another caller's tasks or a
+/// task that is still active. If the caller has nothing to evict, the insert
+/// fails ([`A2aStoreError::OwnerCapacityExceeded`] or
+/// [`A2aStoreError::CapacityExceeded`]). A caller frees space by letting its
+/// tasks finish or canceling them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreLimits {
-    /// Maximum number of tasks held at once. When the store is full, the
-    /// least recently updated terminal task is evicted to make room. If every
-    /// task is still active, the insert fails with
-    /// [`A2aStoreError::CapacityExceeded`] rather than dropping live work.
+    /// Maximum number of tasks held at once, across all owners.
     pub max_tasks: usize,
-    /// Tasks not updated for this long are evicted, whatever their state.
-    /// `None` keeps tasks until capacity eviction removes them.
-    pub ttl: Option<Duration>,
+    /// Maximum number of tasks one owner holds at once. Without an
+    /// authenticator every task has the same (empty) owner, so this is also
+    /// the limit of a single-tenant server.
+    pub max_tasks_per_owner: usize,
+    /// Terminal tasks not updated for this long are evicted. `None` keeps
+    /// them until capacity eviction removes them.
+    pub terminal_ttl: Option<Duration>,
+    /// Active and interrupted tasks (submitted, working, input-required,
+    /// auth-required) not updated for this long are evicted. The default is
+    /// `None`, so a task waiting on a human is never dropped for being idle.
+    pub active_ttl: Option<Duration>,
+    /// Maximum number of messages in one task's history.
+    pub max_history_messages: usize,
+    /// Maximum size of one task's history, as serialized JSON.
+    pub max_history_bytes: usize,
 }
 
 impl StoreLimits {
-    /// Default maximum number of tasks: 10,000.
+    /// Default maximum number of tasks across all owners: 10,000.
     pub const DEFAULT_MAX_TASKS: usize = 10_000;
-    /// Default idle time before a task is evicted: one hour.
-    pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
+    /// Default maximum number of tasks per owner: 1,000.
+    pub const DEFAULT_MAX_TASKS_PER_OWNER: usize = 1_000;
+    /// Default idle time before a terminal task is evicted: one hour.
+    pub const DEFAULT_TERMINAL_TTL: Duration = Duration::from_secs(60 * 60);
+    /// Default maximum number of messages per task: 1,000.
+    pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 1_000;
+    /// Default maximum history size per task: 16 MiB.
+    pub const DEFAULT_MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 }
 
 impl Default for StoreLimits {
     fn default() -> Self {
         Self {
             max_tasks: Self::DEFAULT_MAX_TASKS,
-            ttl: Some(Self::DEFAULT_TTL),
+            max_tasks_per_owner: Self::DEFAULT_MAX_TASKS_PER_OWNER,
+            terminal_ttl: Some(Self::DEFAULT_TERMINAL_TTL),
+            active_ttl: None,
+            max_history_messages: Self::DEFAULT_MAX_HISTORY_MESSAGES,
+            max_history_bytes: Self::DEFAULT_MAX_HISTORY_BYTES,
         }
     }
 }
@@ -136,47 +165,96 @@ struct Entry {
     /// eviction) ends every open stream for the task.
     tx: broadcast::Sender<StreamResponse>,
     last_update: Instant,
+    /// Serialized size of `task.history`.
+    history_bytes: usize,
 }
 
 struct InMemoryInner {
     tasks: HashMap<String, Entry>,
     /// Insertion-order list of task IDs (used for cursor-based pagination).
     order: Vec<String>,
+    /// Number of live tasks per owner.
+    per_owner: HashMap<Option<String>, usize>,
+    /// For each contextId in use: its owner and how many tasks use it.
+    contexts: HashMap<String, (Option<String>, usize)>,
+}
+
+fn message_bytes(message: &Message) -> usize {
+    serde_json::to_vec(message).map(|v| v.len()).unwrap_or(0)
 }
 
 impl InMemoryInner {
-    fn is_expired(entry: &Entry, ttl: Option<Duration>, now: Instant) -> bool {
+    fn is_expired(entry: &Entry, limits: &StoreLimits, now: Instant) -> bool {
+        let ttl = if entry.task.status.state.is_terminal() {
+            limits.terminal_ttl
+        } else {
+            limits.active_ttl
+        };
         match ttl {
             Some(ttl) => now.saturating_duration_since(entry.last_update) >= ttl,
             None => false,
         }
     }
 
+    /// Drop a task's map entries and counters. The caller fixes `order`.
+    fn forget(&mut self, task_id: &str) -> bool {
+        let Some(entry) = self.tasks.remove(task_id) else {
+            return false;
+        };
+        if let Some(n) = self.per_owner.get_mut(&entry.owner) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_owner.remove(&entry.owner);
+            }
+        }
+        if let Some(ctx) = &entry.task.context_id {
+            if let Some((_, n)) = self.contexts.get_mut(ctx) {
+                *n -= 1;
+                if *n == 0 {
+                    self.contexts.remove(ctx);
+                }
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, task_id: &str) {
+        if self.forget(task_id) {
+            self.order.retain(|id| id != task_id);
+        }
+    }
+
     /// Remove every task whose TTL has run out.
-    fn evict_expired(&mut self, ttl: Option<Duration>, now: Instant) {
-        if ttl.is_none() {
+    fn evict_expired(&mut self, limits: &StoreLimits, now: Instant) {
+        if limits.terminal_ttl.is_none() && limits.active_ttl.is_none() {
             return;
         }
-        let before = self.tasks.len();
-        self.tasks
-            .retain(|_, entry| !Self::is_expired(entry, ttl, now));
-        if self.tasks.len() != before {
-            let tasks = &self.tasks;
-            self.order.retain(|id| tasks.contains_key(id));
-            debug!(evicted = before - self.tasks.len(), "evicted expired tasks");
+        let expired: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, e)| Self::is_expired(e, limits, now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
         }
+        for id in &expired {
+            self.forget(id);
+        }
+        let tasks = &self.tasks;
+        self.order.retain(|id| tasks.contains_key(id));
+        debug!(evicted = expired.len(), "evicted expired tasks");
     }
 
     /// Look up a live task, evicting it first if its TTL has run out.
     fn live_mut(
         &mut self,
         task_id: &str,
-        ttl: Option<Duration>,
+        limits: &StoreLimits,
         now: Instant,
     ) -> Option<&mut Entry> {
-        if Self::is_expired(self.tasks.get(task_id)?, ttl, now) {
-            self.tasks.remove(task_id);
-            self.order.retain(|id| id != task_id);
+        if Self::is_expired(self.tasks.get(task_id)?, limits, now) {
+            self.remove(task_id);
             return None;
         }
         self.tasks.get_mut(task_id)
@@ -186,11 +264,11 @@ impl InMemoryInner {
     fn live_open_mut(
         &mut self,
         task_id: &str,
-        ttl: Option<Duration>,
+        limits: &StoreLimits,
         now: Instant,
     ) -> Result<&mut Entry, A2aError> {
         let entry =
-            self.live_mut(task_id, ttl, now)
+            self.live_mut(task_id, limits, now)
                 .ok_or_else(|| A2aProtocolError::TaskNotFound {
                     task_id: task_id.to_string(),
                 })?;
@@ -203,28 +281,41 @@ impl InMemoryInner {
         Ok(entry)
     }
 
-    /// Make room for one more task, evicting the least recently updated
-    /// terminal task if the store is full.
-    fn make_room(&mut self, max_tasks: usize) -> Result<(), A2aError> {
-        while self.tasks.len() >= max_tasks {
-            let victim = self
-                .tasks
-                .iter()
-                .filter(|(_, e)| e.task.status.state.is_terminal())
-                .min_by_key(|(_, e)| e.last_update)
-                .map(|(id, _)| id.clone());
-            match victim {
-                Some(id) => {
-                    self.tasks.remove(&id);
-                    self.order.retain(|o| *o != id);
-                    debug!(task_id = %id, "evicted terminal task to make room");
+    /// Evict the least recently updated terminal task of `owner`, if any.
+    fn evict_oldest_terminal_of(&mut self, owner: &Option<String>) -> bool {
+        let victim = self
+            .tasks
+            .iter()
+            .filter(|(_, e)| e.owner == *owner && e.task.status.state.is_terminal())
+            .min_by_key(|(_, e)| e.last_update)
+            .map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                self.remove(&id);
+                debug!(task_id = %id, "evicted terminal task to make room");
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Make room for one more task of `owner`, evicting only that owner's
+    /// terminal tasks.
+    fn make_room(&mut self, owner: &Option<String>, limits: &StoreLimits) -> Result<(), A2aError> {
+        while self.per_owner.get(owner).copied().unwrap_or(0) >= limits.max_tasks_per_owner {
+            if !self.evict_oldest_terminal_of(owner) {
+                return Err(A2aStoreError::OwnerCapacityExceeded {
+                    capacity: limits.max_tasks_per_owner,
                 }
-                None => {
-                    return Err(A2aStoreError::CapacityExceeded {
-                        capacity: max_tasks,
-                    }
-                    .into())
+                .into());
+            }
+        }
+        while self.tasks.len() >= limits.max_tasks {
+            if !self.evict_oldest_terminal_of(owner) {
+                return Err(A2aStoreError::CapacityExceeded {
+                    capacity: limits.max_tasks,
                 }
+                .into());
             }
         }
         Ok(())
@@ -237,8 +328,10 @@ impl InMemoryInner {
 /// production use with multiple server instances, swap in a database-backed
 /// implementation.
 ///
-/// The store is bounded by [`StoreLimits`]: by default it holds at most
-/// 10,000 tasks and evicts tasks that have not been updated for an hour.
+/// The store is bounded by [`StoreLimits`]. By default it holds at most
+/// 10,000 tasks, 1,000 per owner, and 1,000 messages or 16 MiB of history
+/// per task. Terminal tasks are evicted after an hour without updates;
+/// active and interrupted tasks are kept until they finish or are canceled.
 /// Evicting a task ends any open stream for it, and later requests for it
 /// get `TaskNotFoundError`.
 pub struct InMemoryTaskStore {
@@ -258,6 +351,8 @@ impl InMemoryTaskStore {
             inner: Mutex::new(InMemoryInner {
                 tasks: HashMap::new(),
                 order: Vec::new(),
+                per_owner: HashMap::new(),
+                contexts: HashMap::new(),
             }),
             limits,
         }
@@ -290,14 +385,40 @@ impl Default for InMemoryTaskStore {
 impl TaskStore for InMemoryTaskStore {
     async fn insert(&self, task: Task, owner: Option<String>) -> Result<(), A2aError> {
         let now = Instant::now();
+        let limits = &self.limits;
         let mut inner = self.inner.lock().await;
-        inner.evict_expired(self.limits.ttl, now);
+        inner.evict_expired(limits, now);
         let task_id = task.id.clone();
         if inner.tasks.contains_key(&task_id) {
             return Err(A2aStoreError::TaskAlreadyExists { task_id }.into());
         }
-        inner.make_room(self.limits.max_tasks)?;
+        if let Some(ctx) = &task.context_id {
+            if let Some((ctx_owner, _)) = inner.contexts.get(ctx) {
+                if *ctx_owner != owner {
+                    return Err(A2aStoreError::ContextInUse {
+                        context_id: ctx.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+        inner.make_room(&owner, limits)?;
+
+        let history_bytes = task
+            .history
+            .iter()
+            .flatten()
+            .map(message_bytes)
+            .sum::<usize>();
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        if let Some(ctx) = &task.context_id {
+            inner
+                .contexts
+                .entry(ctx.clone())
+                .or_insert((owner.clone(), 0))
+                .1 += 1;
+        }
+        *inner.per_owner.entry(owner.clone()).or_insert(0) += 1;
         inner.order.push(task_id.clone());
         inner.tasks.insert(
             task_id,
@@ -306,6 +427,7 @@ impl TaskStore for InMemoryTaskStore {
                 owner,
                 tx,
                 last_update: now,
+                history_bytes,
             },
         );
         Ok(())
@@ -315,7 +437,7 @@ impl TaskStore for InMemoryTaskStore {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
         Ok(inner
-            .live_mut(task_id, self.limits.ttl, now)
+            .live_mut(task_id, &self.limits, now)
             .map(|e| TaskRecord {
                 task: e.task.clone(),
                 owner: e.owner.clone(),
@@ -325,7 +447,7 @@ impl TaskStore for InMemoryTaskStore {
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), A2aError> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
-        let entry = inner.live_open_mut(task_id, self.limits.ttl, now)?;
+        let entry = inner.live_open_mut(task_id, &self.limits, now)?;
         entry.task.status = status.clone();
         entry.last_update = now;
 
@@ -345,7 +467,7 @@ impl TaskStore for InMemoryTaskStore {
     async fn add_artifact(&self, task_id: &str, artifact: Artifact) -> Result<(), A2aError> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
-        let entry = inner.live_open_mut(task_id, self.limits.ttl, now)?;
+        let entry = inner.live_open_mut(task_id, &self.limits, now)?;
         entry.task.artifacts.push(artifact.clone());
         entry.last_update = now;
 
@@ -365,12 +487,25 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn append_message(&self, task_id: &str, message: Message) -> Result<(), A2aError> {
         let now = Instant::now();
+        let size = message_bytes(&message);
+        let limits = &self.limits;
         let mut inner = self.inner.lock().await;
-        let entry = inner.live_open_mut(task_id, self.limits.ttl, now)?;
-        match entry.task.history {
-            Some(ref mut hist) => hist.push(message),
-            None => entry.task.history = Some(vec![message]),
+        let entry = inner.live_open_mut(task_id, limits, now)?;
+        let count = entry.task.history.as_ref().map_or(0, Vec::len);
+        if count + 1 > limits.max_history_messages
+            || entry.history_bytes + size > limits.max_history_bytes
+        {
+            return Err(A2aStoreError::HistoryFull {
+                task_id: task_id.to_string(),
+            }
+            .into());
         }
+        entry
+            .task
+            .history
+            .get_or_insert_with(Vec::new)
+            .push(message);
+        entry.history_bytes += size;
         entry.last_update = now;
         debug!(task_id, "message appended to history");
         Ok(())
@@ -383,7 +518,7 @@ impl TaskStore for InMemoryTaskStore {
     ) -> Result<ListTasksResponse, A2aError> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
-        inner.evict_expired(self.limits.ttl, now);
+        inner.evict_expired(&self.limits, now);
 
         let page_size = req.page_size.unwrap_or(50).clamp(1, 100) as usize;
         let history_length = req.history_length;
@@ -395,68 +530,55 @@ impl TaskStore for InMemoryTaskStore {
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
 
-        // Step 1: Collect ALL matching tasks (applying filters) in reverse insertion
-        // order (descending — most recently inserted first, per A2A spec).
-        // Only tasks bound to `owner` are visible.
-        let mut all_matching: Vec<Task> = Vec::new();
-        for id in inner.order.iter().rev() {
-            if let Some(entry) = inner.tasks.get(id) {
-                if entry.owner.as_deref() != owner {
-                    continue;
-                }
-                let task = &entry.task;
-                // Filter by context_id.
-                if let Some(ref ctx) = req.context_id {
-                    if task.context_id.as_deref() != Some(ctx.as_str()) {
-                        continue;
-                    }
-                }
-                // Filter by status.
-                if let Some(ref status) = req.status {
-                    if task.status.state != *status {
-                        continue;
-                    }
-                }
-                // Filter by statusTimestampAfter.
-                if let Some(ts_cutoff) = &ts_after {
-                    let passes = task
-                        .status
-                        .timestamp
-                        .as_deref()
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t >= *ts_cutoff)
-                        .unwrap_or(false);
-                    if !passes {
-                        continue;
-                    }
-                }
-                all_matching.push(task.clone());
-            }
-        }
+        // Step 1: Find the matching tasks, most recently inserted first (per
+        // A2A spec), without copying them. Only tasks bound to `owner` are
+        // visible.
+        let matching: Vec<&Task> = inner
+            .order
+            .iter()
+            .rev()
+            .filter_map(|id| inner.tasks.get(id))
+            .filter(|entry| entry.owner.as_deref() == owner)
+            .map(|entry| &entry.task)
+            .filter(|task| match &req.context_id {
+                Some(ctx) => task.context_id.as_deref() == Some(ctx.as_str()),
+                None => true,
+            })
+            .filter(|task| match &req.status {
+                Some(status) => task.status.state == *status,
+                None => true,
+            })
+            .filter(|task| match &ts_after {
+                Some(cutoff) => task
+                    .status
+                    .timestamp
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .is_some_and(|t| t >= *cutoff),
+                None => true,
+            })
+            .collect();
 
-        let total_size = all_matching.len() as i32;
+        let total_size = matching.len();
 
         // Step 2: Cursor-based pagination on the filtered set.
-        let start_idx = if let Some(ref token) = req.page_token {
-            if token.is_empty() {
-                0
-            } else {
-                // Find the cursor in the filtered list and start after it.
-                all_matching
-                    .iter()
-                    .position(|t| t.id == *token)
-                    .map(|pos| pos + 1)
-                    .unwrap_or(all_matching.len())
-            }
-        } else {
-            0
+        let start_idx = match req.page_token.as_deref() {
+            None | Some("") => 0,
+            // Find the cursor in the filtered list and start after it.
+            Some(token) => matching
+                .iter()
+                .position(|t| t.id == token)
+                .map(|pos| pos + 1)
+                .unwrap_or(total_size),
         };
 
-        let page: Vec<Task> = all_matching
-            .into_iter()
+        // Step 3: Copy only the page.
+        let page: Vec<Task> = matching
+            .iter()
             .skip(start_idx)
             .take(page_size)
-            .map(|mut task| {
+            .map(|task| {
+                let mut task = (*task).clone();
                 // Apply historyLength limiting.
                 if let Some(hl) = history_length {
                     if hl == 0 {
@@ -477,33 +599,31 @@ impl TaskStore for InMemoryTaskStore {
             })
             .collect();
 
-        let actual_count = page.len() as i32;
-
-        // Determine next_page_token: empty string means no more results.
-        let next_page_token =
-            if page.len() == page_size && start_idx + page_size < total_size as usize {
-                page.last().map(|t| t.id.clone()).unwrap_or_default()
-            } else {
-                String::new()
-            };
+        // next_page_token: the last id on this page if more tasks follow,
+        // otherwise an empty string.
+        let next_page_token = if page.len() == page_size && start_idx + page_size < total_size {
+            page.last().map(|t| t.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // pageSize in response = actual number of tasks returned (capped by request).
         Ok(ListTasksResponse {
+            page_size: page.len() as i32,
             tasks: page,
             next_page_token,
-            page_size: actual_count,
-            total_size,
+            total_size: total_size as i32,
         })
     }
 
     async fn cancel(&self, task_id: &str) -> Result<(), A2aError> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
-        let entry = inner
-            .live_mut(task_id, self.limits.ttl, now)
-            .ok_or_else(|| A2aProtocolError::TaskNotFound {
+        let entry = inner.live_mut(task_id, &self.limits, now).ok_or_else(|| {
+            A2aProtocolError::TaskNotFound {
                 task_id: task_id.to_string(),
-            })?;
+            }
+        })?;
 
         // Terminal states cannot be canceled.
         if entry.task.status.state.is_terminal() {
@@ -538,7 +658,7 @@ impl TaskStore for InMemoryTaskStore {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
         inner
-            .live_mut(task_id, self.limits.ttl, now)
+            .live_mut(task_id, &self.limits, now)
             .map(|e| e.tx.subscribe())
     }
 }
@@ -953,8 +1073,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ttl_evicts_idle_tasks_and_closes_their_streams() {
         let store = InMemoryTaskStore::with_limits(StoreLimits {
-            max_tasks: 100,
-            ttl: Some(Duration::from_secs(60)),
+            active_ttl: Some(Duration::from_secs(60)),
+            ..Default::default()
         });
         store.insert(test_task("old"), None).await.unwrap();
         let mut rx = store.subscribe("old").await.unwrap();
@@ -974,8 +1094,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ttl_is_measured_from_the_last_update() {
         let store = InMemoryTaskStore::with_limits(StoreLimits {
-            max_tasks: 100,
-            ttl: Some(Duration::from_secs(60)),
+            active_ttl: Some(Duration::from_secs(60)),
+            ..Default::default()
         });
         store.insert(test_task("t1"), None).await.unwrap();
         tokio::time::advance(Duration::from_secs(40)).await;
@@ -993,7 +1113,8 @@ mod tests {
     async fn full_store_evicts_least_recently_updated_terminal_task() {
         let store = InMemoryTaskStore::with_limits(StoreLimits {
             max_tasks: 3,
-            ttl: None,
+            terminal_ttl: None,
+            ..Default::default()
         });
         store.insert(test_task("done-old"), None).await.unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1024,7 +1145,8 @@ mod tests {
     async fn full_store_of_active_tasks_refuses_new_tasks() {
         let store = InMemoryTaskStore::with_limits(StoreLimits {
             max_tasks: 2,
-            ttl: None,
+            terminal_ttl: None,
+            ..Default::default()
         });
         store.insert(test_task("t1"), None).await.unwrap();
         store.insert(test_task("t2"), None).await.unwrap();
@@ -1039,5 +1161,213 @@ mod tests {
         assert!(store.get("t1").await.unwrap().is_some());
         assert!(store.get("t2").await.unwrap().is_some());
         assert!(store.get("t3").await.unwrap().is_none());
+    }
+
+    fn with_context(id: &str, ctx: &str) -> Task {
+        let mut t = test_task(id);
+        t.context_id = Some(ctx.into());
+        t
+    }
+
+    // ── per-owner limits ──────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_only_takes_the_inserting_owners_tasks() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_tasks: 3,
+            terminal_ttl: None,
+            ..Default::default()
+        });
+        let alice = || Some("alice".to_string());
+        let bob = || Some("bob".to_string());
+        store.insert(test_task("a1"), alice()).await.unwrap();
+        store
+            .update_status("a1", status(TaskState::Completed))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for id in ["b1", "b2"] {
+            store.insert(test_task(id), bob()).await.unwrap();
+            store
+                .update_status(id, status(TaskState::Completed))
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        // Full. Bob's insert evicts bob's oldest result, never alice's.
+        store.insert(test_task("b3"), bob()).await.unwrap();
+        assert!(store.get("a1").await.unwrap().is_some());
+        assert!(store.get("b1").await.unwrap().is_none());
+        assert!(store.get("b2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn one_owner_cannot_fill_the_store_for_everyone() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_tasks: 10,
+            max_tasks_per_owner: 2,
+            ..Default::default()
+        });
+        store
+            .insert(test_task("b1"), Some("bob".into()))
+            .await
+            .unwrap();
+        store
+            .insert(test_task("b2"), Some("bob".into()))
+            .await
+            .unwrap();
+        let err = store
+            .insert(test_task("b3"), Some("bob".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                A2aError::Store(A2aStoreError::OwnerCapacityExceeded { capacity: 2 })
+            ),
+            "got {err:?}"
+        );
+        store
+            .insert(test_task("a1"), Some("alice".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_ceiling_holds_when_the_caller_has_nothing_to_evict() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_tasks: 2,
+            ..Default::default()
+        });
+        for id in ["b1", "b2"] {
+            store
+                .insert(test_task(id), Some("bob".into()))
+                .await
+                .unwrap();
+            store
+                .update_status(id, status(TaskState::Completed))
+                .await
+                .unwrap();
+        }
+        let err = store
+            .insert(test_task("a1"), Some("alice".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, A2aError::Store(A2aStoreError::CapacityExceeded { .. })),
+            "got {err:?}"
+        );
+        assert!(store.get("b1").await.unwrap().is_some());
+        assert!(store.get("b2").await.unwrap().is_some());
+    }
+
+    // ── TTL by state ──────────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn default_ttl_keeps_waiting_tasks_and_drops_old_results() {
+        let store = InMemoryTaskStore::new();
+        store.insert(test_task("waiting"), None).await.unwrap();
+        store
+            .update_status("waiting", status(TaskState::InputRequired))
+            .await
+            .unwrap();
+        store.insert(test_task("done"), None).await.unwrap();
+        store
+            .update_status("done", status(TaskState::Completed))
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+
+        assert!(store.get("waiting").await.unwrap().is_some());
+        assert!(store.get("done").await.unwrap().is_none());
+    }
+
+    // ── history limits ────────────────────────────────────────────────────
+
+    fn msg(id: &str, text: &str) -> Message {
+        Message {
+            message_id: id.into(),
+            context_id: None,
+            task_id: None,
+            role: Role::User,
+            parts: vec![Part {
+                content: PartContent::Text(text.into()),
+                metadata: None,
+                filename: None,
+                media_type: None,
+            }],
+            metadata: None,
+            extensions: vec![],
+            reference_task_ids: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn history_message_count_is_capped() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_history_messages: 2,
+            ..Default::default()
+        });
+        let mut task = test_task("t1");
+        task.history = Some(vec![msg("m1", "a")]);
+        store.insert(task, None).await.unwrap();
+        store.append_message("t1", msg("m2", "b")).await.unwrap();
+        let err = store
+            .append_message("t1", msg("m3", "c"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, A2aError::Store(A2aStoreError::HistoryFull { .. })),
+            "got {err:?}"
+        );
+        let task = store.get("t1").await.unwrap().unwrap();
+        assert_eq!(task.history.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn history_bytes_are_capped() {
+        let store = InMemoryTaskStore::with_limits(StoreLimits {
+            max_history_bytes: 1024,
+            ..Default::default()
+        });
+        store.insert(test_task("t1"), None).await.unwrap();
+        store
+            .append_message("t1", msg("m1", "small"))
+            .await
+            .unwrap();
+        let err = store
+            .append_message("t1", msg("m2", &"x".repeat(2048)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, A2aError::Store(A2aStoreError::HistoryFull { .. })),
+            "got {err:?}"
+        );
+    }
+
+    // ── contextId ownership ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_id_of_another_owner_is_refused() {
+        let store = InMemoryTaskStore::new();
+        store
+            .insert(with_context("a1", "ctx-1"), Some("alice".into()))
+            .await
+            .unwrap();
+        let err = store
+            .insert(with_context("b1", "ctx-1"), Some("bob".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, A2aError::Store(A2aStoreError::ContextInUse { .. })),
+            "got {err:?}"
+        );
+        // The owner can keep using it.
+        store
+            .insert(with_context("a2", "ctx-1"), Some("alice".into()))
+            .await
+            .unwrap();
     }
 }

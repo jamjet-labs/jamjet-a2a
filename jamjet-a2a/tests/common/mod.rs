@@ -189,3 +189,27 @@ pub async fn wait_for_state(base_url: &str, token: Option<&str>, task_id: &str, 
     }
     panic!("task {task_id} never reached {state}");
 }
+
+/// Send raw bytes on a fresh TCP connection and return what the server
+/// sends back within `wait` (or until it closes the connection).
+pub async fn raw_exchange(base_url: &str, request: &[u8], wait: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = base_url.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(request).await.expect("write");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}

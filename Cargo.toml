@@ -14,6 +14,7 @@ serde_json = "1"
 base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
 async-trait = "0.1"
 thiserror = "2"
@@ -22,3 +23,4 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 proptest = "1"
+subtle = "2.6"

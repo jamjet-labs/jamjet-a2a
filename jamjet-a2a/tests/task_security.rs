@@ -476,16 +476,16 @@ async fn unauthenticated_request_is_rejected_before_its_body_is_read() {
             .with_authenticator(TestTokens),
     )
     .await;
-    // 3 MB is over the 2 MB body limit. Reading the body first would give 413.
-    let big = "x".repeat(3 * 1024 * 1024);
-    let resp = reqwest::Client::new()
-        .post(format!("{url}/"))
-        .header("content-type", "application/json")
-        .body(big)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 401);
+    // Announce a body and never send it. A server that reads the body before
+    // authenticating sends "100 Continue" and waits; this one must answer 401
+    // straight away.
+    let request = b"POST / HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n\
+Content-Length: 3145728\r\nExpect: 100-continue\r\n\r\n";
+    let response = raw_exchange(&url, request, Duration::from_secs(3)).await;
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "expected 401 before the body, got {response:?}"
+    );
 }
 
 #[tokio::test]
@@ -563,4 +563,248 @@ async fn follow_up_stream_ends_when_the_task_completes() {
         .expect("follow-up stream did not close after the task completed");
     let last = events.last().expect("no events").as_ref().unwrap();
     assert_eq!(state_of(last), Some(TaskState::Completed));
+}
+
+// ── second review ───────────────────────────────────────────────────────────
+
+/// Allows everything except CancelTask (a denylist).
+struct NoCancel;
+
+#[async_trait::async_trait]
+impl Authenticator for NoCancel {
+    async fn authenticate(&self, _headers: &axum::http::HeaderMap) -> Result<Principal, A2aError> {
+        Ok(Principal::new("u"))
+    }
+    fn authorize(&self, _principal: &Principal, method: &str) -> bool {
+        method != "CancelTask"
+    }
+}
+
+#[tokio::test]
+async fn alias_cannot_get_around_a_denylist_authorizer() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_authenticator(NoCancel),
+    )
+    .await;
+    let task_id = create_task(&url, None, None).await;
+    for method in ["CancelTask", "tasks/cancel"] {
+        let (status, body) = rpc(&url, None, method, json!({"id": task_id})).await;
+        assert_eq!(status, 403, "{method}: {body}");
+    }
+}
+
+fn is_protocol_error(result: &Result<impl Sized, A2aError>, code: i32) -> bool {
+    matches!(result, Err(A2aError::Protocol(p)) if p.json_rpc_code() == code)
+}
+
+#[tokio::test]
+async fn client_reports_errors_from_streaming_calls() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(CompleteHandler)).await;
+    let task_id = create_task(&url, None, None).await;
+    wait_for_state(&url, None, &task_id, "TASK_STATE_COMPLETED").await;
+    let client = A2aClient::new();
+
+    let result = client.subscribe(&url, &task_id).await.map(|_| ());
+    assert!(is_protocol_error(&result, -32004), "{result:?}");
+
+    let mut follow_up = send_request("again");
+    follow_up.message.task_id = Some(task_id.clone());
+    let result = client.send_streaming(&url, follow_up).await.map(|_| ());
+    assert!(is_protocol_error(&result, -32004), "{result:?}");
+
+    let mut unknown = send_request("hi");
+    unknown.message.task_id = Some("no-such-task".into());
+    let result = client.send_streaming(&url, unknown).await.map(|_| ());
+    assert!(is_protocol_error(&result, -32001), "{result:?}");
+}
+
+#[tokio::test]
+async fn streams_start_with_the_task() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(HoldHandler)).await;
+    let client = A2aClient::new();
+
+    // SendStreamingMessage (A2A 3.1.2).
+    let mut stream = client
+        .send_streaming(&url, send_request("hi"))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("no first event")
+        .unwrap()
+        .unwrap();
+    let StreamResponse::Task(task) = first else {
+        panic!("first event is not a Task: {first:?}");
+    };
+
+    // SubscribeToTask (A2A 3.1.6).
+    wait_for_state(&url, None, &task.id, "TASK_STATE_WORKING").await;
+    let mut stream = client.subscribe(&url, &task.id).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("no first event")
+        .unwrap()
+        .unwrap();
+    match first {
+        StreamResponse::Task(t) => assert_eq!(t.id, task.id),
+        other => panic!("first event is not a Task: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn subscribing_to_a_task_waiting_for_input_sends_it_and_closes() {
+    let url = serve(A2aServer::new(agent_card()).with_handler(AskThenFinishHandler)).await;
+    let task_id = create_task(&url, None, None).await;
+    wait_for_state(&url, None, &task_id, "TASK_STATE_INPUT_REQUIRED").await;
+
+    let stream = A2aClient::new().subscribe(&url, &task_id).await.unwrap();
+    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("subscription to an input-required task did not close");
+    assert_eq!(events.len(), 1, "{events:?}");
+    match events[0].as_ref().unwrap() {
+        StreamResponse::Task(t) => assert_eq!(t.status.state, TaskState::InputRequired),
+        other => panic!("expected the Task, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn open_streams_per_caller_are_limited() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_max_streams_per_caller(1),
+    )
+    .await;
+    let first_task = create_task(&url, None, None).await;
+    let second_task = create_task(&url, None, None).await;
+    let client = A2aClient::new();
+
+    let held = client.subscribe(&url, &first_task).await.unwrap();
+    let (status, body) = rpc(&url, None, "SubscribeToTask", json!({"id": second_task})).await;
+    assert_eq!(status, 429, "{body}");
+    assert_auth_code(&body, jamjet_a2a::server::TOO_MANY_STREAMS_ERROR_CODE);
+
+    // Once the first stream ends, the slot is free again.
+    let (_, body) = rpc(&url, None, "CancelTask", json!({"id": first_task})).await;
+    assert_eq!(body["result"]["status"]["state"], "TASK_STATE_CANCELED");
+    let _: Vec<_> = tokio::time::timeout(Duration::from_secs(5), held.collect())
+        .await
+        .expect("first stream did not end");
+    let stream = client.subscribe(&url, &second_task).await;
+    assert!(stream.is_ok(), "{:?}", stream.err());
+}
+
+#[tokio::test]
+async fn slow_request_body_gets_408() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_body_read_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    let request = b"POST / HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n\
+Content-Length: 100\r\n\r\n{\"jsonrpc\":";
+    let response = raw_exchange(&url, request, Duration::from_secs(3)).await;
+    assert!(response.starts_with("HTTP/1.1 408"), "{response:?}");
+}
+
+#[tokio::test]
+async fn slow_request_headers_close_the_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = A2aServer::new(agent_card())
+        .with_handler(HoldHandler)
+        .with_header_read_timeout(Duration::from_millis(300));
+    tokio::spawn(server.serve(listener));
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = url.trim_start_matches("http://").to_string();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nHost: te")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
+    assert!(
+        read.is_ok(),
+        "server kept a connection with unfinished headers open"
+    );
+}
+
+#[tokio::test]
+async fn context_id_of_another_caller_is_refused() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_authenticator(TestTokens),
+    )
+    .await;
+    create_task(&url, Some("alice-token"), Some("ctx-shared")).await;
+    let (_, body) = rpc(
+        &url,
+        Some("bob-token"),
+        "SendMessage",
+        json!({"message": message("b-1", "x", None, Some("ctx-shared"))}),
+    )
+    .await;
+    assert_eq!(error_code(&body), Some(INVALID_PARAMS), "{body}");
+}
+
+/// A store whose `list` ignores the caller and always returns alice's tasks.
+struct LeakyList(jamjet_a2a::store::InMemoryTaskStore);
+
+#[async_trait::async_trait]
+impl jamjet_a2a::store::TaskStore for LeakyList {
+    async fn insert(&self, task: Task, owner: Option<String>) -> Result<(), A2aError> {
+        self.0.insert(task, owner).await
+    }
+    async fn get_record(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<jamjet_a2a::store::TaskRecord>, A2aError> {
+        self.0.get_record(task_id).await
+    }
+    async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), A2aError> {
+        self.0.update_status(task_id, status).await
+    }
+    async fn add_artifact(&self, task_id: &str, artifact: Artifact) -> Result<(), A2aError> {
+        self.0.add_artifact(task_id, artifact).await
+    }
+    async fn list(
+        &self,
+        req: &ListTasksRequest,
+        _owner: Option<&str>,
+    ) -> Result<ListTasksResponse, A2aError> {
+        self.0.list(req, Some("alice")).await
+    }
+    async fn append_message(&self, task_id: &str, message: Message) -> Result<(), A2aError> {
+        self.0.append_message(task_id, message).await
+    }
+    async fn cancel(&self, task_id: &str) -> Result<(), A2aError> {
+        self.0.cancel(task_id).await
+    }
+    async fn subscribe(
+        &self,
+        task_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<StreamResponse>> {
+        self.0.subscribe(task_id).await
+    }
+}
+
+#[tokio::test]
+async fn server_drops_other_callers_tasks_from_a_leaky_list() {
+    let url = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_store(LeakyList(jamjet_a2a::store::InMemoryTaskStore::new()))
+            .with_authenticator(TestTokens),
+    )
+    .await;
+    create_task(&url, Some("alice-token"), None).await;
+    let (_, body) = rpc(&url, Some("bob-token"), "ListTasks", json!({})).await;
+    assert_eq!(body["result"]["tasks"], json!([]), "{body}");
 }

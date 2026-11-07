@@ -127,12 +127,18 @@ async fn stream_times_out_when_the_server_goes_quiet() {
 
 #[tokio::test]
 async fn stream_gives_up_on_an_event_that_never_ends() {
-    // 17 MB of data with no event delimiter.
+    // 17 MB of data with no line break, and the connection stays open, so
+    // only the size limit can end the stream.
     let router = axum::Router::new().route(
         "/",
         post(|| async {
-            let body = "x".repeat(17 * 1024 * 1024);
-            ([("content-type", "text/event-stream")], body)
+            let chunk = axum::body::Bytes::from("x".repeat(17 * 1024 * 1024));
+            let body = futures::stream::once(async move { Ok::<_, Infallible>(chunk) })
+                .chain(futures::stream::pending());
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(body),
+            )
         }),
     );
     let url = common::serve_router(router).await;
@@ -143,13 +149,101 @@ async fn stream_gives_up_on_an_event_that_never_ends() {
         .await
         .expect("stream hung")
         .expect("stream ended without reporting the oversized event");
+    match first {
+        Err(A2aError::Transport(A2aTransportError::InvalidResponse { details })) => {
+            assert!(details.contains("larger than"), "{details}")
+        }
+        other => panic!("expected a size error, got {other:?}"),
+    }
+}
+
+/// Serve a fixed body with the given content type for POST /.
+async fn fixed_server(content_type: &'static str, body: String) -> String {
+    let router = axum::Router::new().route(
+        "/",
+        post(move || {
+            let body = body.clone();
+            async move { ([("content-type", content_type)], body) }
+        }),
+    );
+    common::serve_router(router).await
+}
+
+fn state(event: &StreamResponse) -> Option<TaskState> {
+    match event {
+        StreamResponse::StatusUpdate(e) => Some(e.status.state.clone()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn sse_parser_handles_crlf_bare_colons_multiline_data_and_json_rpc() {
+    let working = r#"{"taskId":"t-1","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}"#;
+    let body = format!(
+        ": a comment\r\n\
+         data:{working}\r\n\r\n\
+         event: update\n\
+         data: {{\"taskId\":\"t-1\",\n\
+         data: \"contextId\":\"c\",\"status\":{{\"state\":\"TASK_STATE_INPUT_REQUIRED\"}}}}\n\n\
+         data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"statusUpdate\":{working}}}}}\r\r\
+         data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32001,\"message\":\"gone\"}}}}\n\n"
+    );
+    let url = fixed_server("text/event-stream", body).await;
+    let stream = A2aClient::new()
+        .send_streaming(&url, send_request())
+        .await
+        .unwrap();
+    let items: Vec<_> = stream.collect().await;
+    assert_eq!(items.len(), 4, "{items:?}");
+    assert_eq!(state(items[0].as_ref().unwrap()), Some(TaskState::Working));
+    assert_eq!(
+        state(items[1].as_ref().unwrap()),
+        Some(TaskState::InputRequired)
+    );
+    assert_eq!(state(items[2].as_ref().unwrap()), Some(TaskState::Working));
     assert!(
         matches!(
-            first,
+            &items[3],
+            Err(A2aError::Protocol(A2aProtocolError::TaskNotFound { .. }))
+        ),
+        "{:?}",
+        items[3]
+    );
+}
+
+#[tokio::test]
+async fn stream_that_stops_mid_event_is_an_error() {
+    let body = r#"data: {"taskId":"t-1","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}"#;
+    let url = fixed_server("text/event-stream", body.to_string()).await;
+    let stream = A2aClient::new()
+        .send_streaming(&url, send_request())
+        .await
+        .unwrap();
+    let items: Vec<_> = stream.collect().await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        matches!(
+            &items[0],
             Err(A2aError::Transport(
                 A2aTransportError::InvalidResponse { .. }
             ))
         ),
-        "{first:?}"
+        "{items:?}"
     );
+}
+
+#[tokio::test]
+async fn oversized_unary_response_is_refused() {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"pad":"{}"}}}}"#,
+        "x".repeat(17 * 1024 * 1024)
+    );
+    let url = fixed_server("application/json", body).await;
+    let result = A2aClient::new().get_task(&url, get_task_request()).await;
+    match result {
+        Err(A2aError::Transport(A2aTransportError::InvalidResponse { details })) => {
+            assert!(details.contains("larger than"), "{details}")
+        }
+        other => panic!("expected a size error, got {other:?}"),
+    }
 }

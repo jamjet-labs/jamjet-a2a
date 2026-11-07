@@ -35,9 +35,11 @@ use axum::{
     Router,
 };
 use jamjet_a2a_types::*;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -108,6 +110,48 @@ struct ServerState {
     store: Arc<dyn TaskStore>,
     handler: Arc<Option<Box<dyn TaskHandler>>>,
     authenticator: Option<Arc<dyn Authenticator>>,
+    streams: Arc<StreamSlots>,
+    body_read_timeout: Duration,
+}
+
+/// Counts open SSE streams per caller.
+struct StreamSlots {
+    max_per_caller: usize,
+    open: std::sync::Mutex<HashMap<Option<String>, usize>>,
+}
+
+/// One open stream. Dropping it (when the stream ends or the client goes
+/// away) frees the slot.
+struct StreamSlot {
+    slots: Arc<StreamSlots>,
+    owner: Option<String>,
+}
+
+impl StreamSlots {
+    fn acquire(self: &Arc<Self>, owner: &Option<String>) -> Option<StreamSlot> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(owner.clone()).or_insert(0);
+        if *n >= self.max_per_caller {
+            return None;
+        }
+        *n += 1;
+        Some(StreamSlot {
+            slots: Arc::clone(self),
+            owner: owner.clone(),
+        })
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut open = self.slots.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.owner) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.owner);
+            }
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -154,6 +198,9 @@ pub struct A2aServer {
     handler: Option<Box<dyn TaskHandler>>,
     store: Option<Box<dyn TaskStore>>,
     authenticator: Option<Arc<dyn Authenticator>>,
+    header_read_timeout: Duration,
+    body_read_timeout: Duration,
+    max_streams_per_caller: usize,
 }
 
 impl A2aServer {
@@ -166,7 +213,41 @@ impl A2aServer {
             handler: None,
             store: None,
             authenticator: None,
+            header_read_timeout: Self::DEFAULT_HEADER_READ_TIMEOUT,
+            body_read_timeout: Self::DEFAULT_BODY_READ_TIMEOUT,
+            max_streams_per_caller: Self::DEFAULT_MAX_STREAMS_PER_CALLER,
         }
+    }
+
+    /// Default time a client has to send the request headers: 30 s.
+    pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default time a client has to send the request body: 30 s.
+    pub const DEFAULT_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default number of SSE streams one caller may hold open: 100.
+    pub const DEFAULT_MAX_STREAMS_PER_CALLER: usize = 100;
+
+    /// How long a client may take to send the request headers before the
+    /// connection is closed. Applies to [`start`](Self::start) and
+    /// [`serve`](Self::serve); with [`into_router`](Self::into_router) the
+    /// HTTP server you run it on decides.
+    pub fn with_header_read_timeout(mut self, timeout: Duration) -> Self {
+        self.header_read_timeout = timeout;
+        self
+    }
+
+    /// How long a client may take to send a JSON-RPC request body before the
+    /// server answers 408.
+    pub fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
+        self.body_read_timeout = timeout;
+        self
+    }
+
+    /// How many SSE streams (SendStreamingMessage, SubscribeToTask) one
+    /// caller may hold open at once. Without an authenticator all callers
+    /// count as one.
+    pub fn with_max_streams_per_caller(mut self, max: usize) -> Self {
+        self.max_streams_per_caller = max;
+        self
     }
 
     /// Set the port to listen on (default: 3000).
@@ -220,6 +301,11 @@ impl A2aServer {
             store,
             handler: Arc::new(self.handler),
             authenticator: self.authenticator,
+            streams: Arc::new(StreamSlots {
+                max_per_caller: self.max_streams_per_caller,
+                open: std::sync::Mutex::new(HashMap::new()),
+            }),
+            body_read_timeout: self.body_read_timeout,
         };
 
         Router::new()
@@ -233,6 +319,26 @@ impl A2aServer {
     /// (default `127.0.0.1:3000`).
     pub async fn start(self) -> Result<(), A2aError> {
         let addr = SocketAddr::new(self.bind_addr, self.port);
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            A2aTransportError::Connection {
+                url: addr.to_string(),
+                source: Box::new(e),
+            }
+        })?;
+        self.serve(listener).await
+    }
+
+    /// Serve on an already bound listener. Runs until the listener fails.
+    ///
+    /// Each connection gets the header read timeout set with
+    /// [`with_header_read_timeout`](Self::with_header_read_timeout).
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), A2aError> {
+        let addr = listener
+            .local_addr()
+            .map_err(|e| A2aTransportError::Connection {
+                url: "listener".into(),
+                source: Box::new(e),
+            })?;
         if exposed_without_auth(addr.ip(), self.authenticator.is_some()) {
             warn!(
                 addr = %addr,
@@ -241,24 +347,35 @@ impl A2aServer {
                  subscribe to every task. Use A2aServer::with_authenticator, or bind to 127.0.0.1."
             );
         }
+        let header_read_timeout = self.header_read_timeout;
         let router = self.into_router();
         info!(addr = %addr, "starting A2A server");
 
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            A2aTransportError::Connection {
-                url: addr.to_string(),
-                source: Box::new(e),
-            }
-        })?;
-
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| A2aTransportError::Connection {
-                url: addr.to_string(),
-                source: Box::new(e),
-            })?;
-
-        Ok(())
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Usually out of file descriptors; back off and retry.
+                    warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let service = hyper_util::service::TowerToHyperService::new(router.clone());
+            tokio::spawn(async move {
+                let mut builder = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                );
+                builder
+                    .http1()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(header_read_timeout);
+                let io = hyper_util::rt::TokioIo::new(stream);
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    debug!(error = %e, "connection ended with an error");
+                }
+            });
+        }
     }
 }
 
@@ -324,9 +441,15 @@ async fn jsonrpc_handler(
         return crate::auth::unauthenticated_response();
     }
 
-    let body = match axum::body::to_bytes(body, MAX_RPC_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let body = match tokio::time::timeout(
+        state.body_read_timeout,
+        axum::body::to_bytes(body, MAX_RPC_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
     };
 
     // Step 1: Parse JSON from raw bytes.
@@ -746,7 +869,20 @@ async fn handle_list_tasks(
     }
 
     match state.store.list(&req, owner.as_deref()).await {
-        Ok(resp) => make_success_response(rpc.id, &resp).into_response(),
+        Ok(mut resp) => {
+            // Do not rely on a custom store's filtering alone: drop anything
+            // that is not the caller's.
+            let mut visible = Vec::with_capacity(resp.tasks.len());
+            for task in resp.tasks {
+                match state.store.get_record(&task.id).await {
+                    Ok(Some(rec)) if rec.owner.as_deref() == owner.as_deref() => visible.push(task),
+                    _ => error!(task_id = %task.id, "store listed a task the caller does not own"),
+                }
+            }
+            resp.page_size = visible.len() as i32;
+            resp.tasks = visible;
+            make_success_response(rpc.id, &resp).into_response()
+        }
         Err(e) => make_error_response(rpc.id, e).into_response(),
     }
 }
@@ -787,6 +923,9 @@ async fn handle_send_streaming(
     let req: SendMessageRequest = match parse_params(&mut rpc) {
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
+    };
+    let Some(slot) = state.streams.acquire(&owner) else {
+        return too_many_streams_response(rpc.id);
     };
     let message = req.message.clone();
 
@@ -835,8 +974,26 @@ async fn handle_send_streaming(
         }
     };
 
+    // A2A 3.1.2: the stream starts with the Task. Take the snapshot before
+    // the handler runs; later changes arrive on `rx`.
+    let initial = match state.store.get(&task_id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id })
+                .into_response()
+        }
+        Err(e) => return make_error_response(rpc.id, e).into_response(),
+    };
     spawn_handler(&state, task_id.clone(), message, new);
-    make_sse_stream(rx, Arc::clone(&state.store), task_id).into_response()
+    let events = task_event_stream(
+        rx,
+        Arc::clone(&state.store),
+        task_id,
+        Some(initial),
+        false,
+        Some(slot),
+    );
+    make_sse_stream(events).into_response()
 }
 
 async fn handle_subscribe(
@@ -866,7 +1023,24 @@ async fn handle_subscribe(
             make_error_response(rpc.id, A2aProtocolError::TaskTerminal { task_id: req.id })
                 .into_response()
         }
-        Ok(Some(_)) => make_sse_stream(rx, Arc::clone(&state.store), req.id).into_response(),
+        Ok(Some(task)) => {
+            let Some(slot) = state.streams.acquire(&owner) else {
+                return too_many_streams_response(rpc.id);
+            };
+            // A2A 3.1.6: the stream starts with the current Task. A task that
+            // is already waiting for input gets that one event and the
+            // stream closes, the same rule as for a live update.
+            let close_now = task.status.state.is_interrupted();
+            let events = task_event_stream(
+                rx,
+                Arc::clone(&state.store),
+                req.id,
+                Some(task),
+                close_now,
+                Some(slot),
+            );
+            make_sse_stream(events).into_response()
+        }
         Ok(None) => make_error_response(rpc.id, A2aProtocolError::TaskNotFound { task_id: req.id })
             .into_response(),
         Err(e) => make_error_response(rpc.id, e).into_response(),
@@ -920,37 +1094,71 @@ fn status_event(task: Task) -> StreamResponse {
     })
 }
 
-/// Events for one task, ending after the event that moves it to a terminal
-/// or interrupted state.
+/// JSON-RPC error code sent with HTTP 429 when a caller already holds the
+/// maximum number of open streams.
+pub const TOO_MANY_STREAMS_ERROR_CODE: i32 = -31429;
+
+fn too_many_streams_response(id: serde_json::Value) -> axum::response::Response {
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": TOO_MANY_STREAMS_ERROR_CODE,
+                "message": "Too many open streams for this caller",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Events for one task: `initial` first, if given, then live updates,
+/// ending after the event that moves the task to a terminal or interrupted
+/// state. With `close_after_initial` the stream ends right after `initial`.
 ///
 /// The stream also ends when the task leaves the store: the channel closes
 /// on eviction, and an idle stream checks the store every
 /// [`STREAM_RECHECK_INTERVAL`] so a task that expired is noticed even if
 /// nothing else touched the store. If the receiver lagged past the final
 /// event, or the idle check finds the task terminal, the current status is
-/// sent before closing. Events for other tasks are dropped.
+/// sent before closing. Events for other tasks are dropped. `slot` is held
+/// until the stream ends.
 fn task_event_stream(
     rx: broadcast::Receiver<StreamResponse>,
     store: Arc<dyn TaskStore>,
     task_id: String,
+    initial: Option<Task>,
+    close_after_initial: bool,
+    slot: Option<StreamSlot>,
 ) -> impl futures::Stream<Item = StreamResponse> + Send {
     struct StreamState {
         rx: broadcast::Receiver<StreamResponse>,
         store: Arc<dyn TaskStore>,
         task_id: String,
+        initial: Option<Task>,
+        close_after_initial: bool,
         done: bool,
+        _slot: Option<StreamSlot>,
     }
 
     let init = StreamState {
         rx,
         store,
         task_id,
+        initial,
+        close_after_initial,
         done: false,
+        _slot: slot,
     };
 
     futures::stream::unfold(init, |mut st| async move {
         if st.done {
             return None;
+        }
+        if let Some(task) = st.initial.take() {
+            st.done = st.close_after_initial;
+            return Some((StreamResponse::Task(task), st));
         }
         loop {
             let received = tokio::time::timeout(STREAM_RECHECK_INTERVAL, st.rx.recv()).await;
@@ -994,13 +1202,11 @@ fn task_event_stream(
     })
 }
 
-/// Serve [`task_event_stream`] as SSE, with keep-alives.
+/// Serve a stream of events as SSE, with keep-alives.
 fn make_sse_stream(
-    rx: broadcast::Receiver<StreamResponse>,
-    store: Arc<dyn TaskStore>,
-    task_id: String,
+    events: impl futures::Stream<Item = StreamResponse> + Send + 'static,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures::StreamExt::map(task_event_stream(rx, store, task_id), |event| {
+    let stream = futures::StreamExt::map(events, |event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok(Event::default().data(json))
     });
@@ -1030,6 +1236,10 @@ fn make_error_response(
     match error {
         A2aError::Protocol(ref proto) => {
             make_json_rpc_error_response(id, proto.json_rpc_code(), &error.to_string(), None)
+        }
+        // A2A 3.4.1: a contextId the agent cannot accept is a request error.
+        A2aError::Store(A2aStoreError::ContextInUse { .. }) => {
+            make_json_rpc_error_response(id, -32602, &format!("Invalid params: {error}"), None)
         }
         _ => make_json_rpc_error_response(id, -32603, &error.to_string(), None),
     }
@@ -1124,12 +1334,19 @@ mod tests {
         use futures::StreamExt;
 
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::with_limits(StoreLimits {
-            max_tasks: 10,
-            ttl: Some(std::time::Duration::from_secs(60)),
+            active_ttl: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
         }));
         store.insert(bare_task("t1"), None).await.unwrap();
         let rx = store.subscribe("t1").await.unwrap();
-        let mut events = Box::pin(task_event_stream(rx, store.clone(), "t1".into()));
+        let mut events = Box::pin(task_event_stream(
+            rx,
+            store.clone(),
+            "t1".into(),
+            None,
+            false,
+            None,
+        ));
 
         // Nothing else touches the store, so only the stream's own check can
         // notice that the task expired.
@@ -1161,7 +1378,9 @@ mod tests {
         tx.send(status("t1", TaskState::Working)).unwrap();
         tx.send(status("t1", TaskState::Completed)).unwrap();
 
-        let events: Vec<_> = task_event_stream(rx, store, "t1".into()).collect().await;
+        let events: Vec<_> = task_event_stream(rx, store, "t1".into(), None, false, None)
+            .collect()
+            .await;
         let ids: Vec<_> = events
             .iter()
             .map(|e| event_task_id(e).unwrap().to_string())

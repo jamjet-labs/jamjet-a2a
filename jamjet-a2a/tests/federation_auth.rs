@@ -265,3 +265,46 @@ async fn layer_and_authenticator_together() {
     let (_, body) = rpc(&url, Some("tok-beta"), "GetTask", json!({"id": task_id})).await;
     assert_eq!(error_code(&body), Some(TASK_NOT_FOUND), "{body}");
 }
+
+fn optional_policy() -> FederationPolicy {
+    FederationPolicy {
+        require_auth: false,
+        tokens: vec![FederationToken {
+            token: "tok-alpha".into(),
+            name: "alpha".into(),
+            agent_id: Some("agent-alpha".into()),
+            scopes: vec!["write".into()],
+        }],
+        ..Default::default()
+    }
+}
+
+/// With auth optional, a token that is sent must still be checked and bind
+/// the task, through the layer exactly as through the authenticator.
+#[tokio::test]
+async fn optional_auth_binds_tokens_in_the_layer_like_the_authenticator() {
+    let layered = A2aServer::new(agent_card())
+        .with_handler(HoldHandler)
+        .into_router()
+        .layer(middleware::from_fn_with_state(
+            optional_policy(),
+            federation_auth_layer,
+        ));
+    let layered = serve_router(layered).await;
+    let direct = serve(
+        A2aServer::new(agent_card())
+            .with_handler(HoldHandler)
+            .with_authenticator(optional_policy()),
+    )
+    .await;
+
+    for url in [layered, direct] {
+        let task_id = create_task(&url, Some("tok-alpha"), None).await;
+        let (_, body) = rpc(&url, None, "GetTask", json!({"id": task_id})).await;
+        assert_eq!(error_code(&body), Some(TASK_NOT_FOUND), "{url}: {body}");
+        let (status, _) = rpc(&url, Some("garbage"), "ListTasks", json!({})).await;
+        assert_eq!(status, 401, "{url}");
+        let (_, body) = rpc(&url, Some("tok-alpha"), "GetTask", json!({"id": task_id})).await;
+        assert_eq!(body["result"]["id"], task_id.as_str(), "{url}: {body}");
+    }
+}

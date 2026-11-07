@@ -113,10 +113,23 @@ pub enum A2aStoreError {
     #[error("task already exists: {task_id}")]
     TaskAlreadyExists { task_id: String },
 
-    /// The store holds its maximum number of live tasks and none could be
-    /// evicted.
+    /// The store holds its maximum number of live tasks and none of the
+    /// caller's own terminal tasks could be evicted.
     #[error("task store is full ({capacity} tasks)")]
     CapacityExceeded { capacity: usize },
+
+    /// The caller already holds its maximum number of live tasks and none of
+    /// them is terminal.
+    #[error("too many live tasks for this caller (limit {capacity})")]
+    OwnerCapacityExceeded { capacity: usize },
+
+    /// The task's history is at its message or byte limit.
+    #[error("history of task {task_id} is full")]
+    HistoryFull { task_id: String },
+
+    /// The `contextId` is already used by another caller's tasks.
+    #[error("contextId {context_id} is used by another caller")]
+    ContextInUse { context_id: String },
 }
 
 // ────────────────────────────────────────────────────────────────────────────

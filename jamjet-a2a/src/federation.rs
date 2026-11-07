@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 // ── Federation auth policy ──────────────────────────────────────────────────
@@ -129,14 +130,6 @@ impl FederationIdentity {
 /// false and the policy is used as an [`Authenticator`].
 pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
 
-/// Compare two byte strings without stopping at the first difference.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Validate a Bearer token against the federation policy.
 pub fn validate_federation_token(
     headers: &HeaderMap,
@@ -149,8 +142,11 @@ pub fn validate_federation_token(
             reason: "missing authorization header".into(),
         })?;
 
+    // The scheme name is case-insensitive (RFC 7235 section 2.1).
     let token = auth_header
-        .strip_prefix("Bearer ")
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, rest)| rest.trim())
         .ok_or_else(|| A2aError::Auth {
             reason: "authorization must be Bearer token".into(),
         })?;
@@ -165,7 +161,8 @@ pub fn validate_federation_token(
     // which one (if any) matched.
     let mut found = None;
     for candidate in &policy.tokens {
-        if constant_time_eq(candidate.token.as_bytes(), token.as_bytes()) && found.is_none() {
+        let matches: bool = candidate.token.as_bytes().ct_eq(token.as_bytes()).into();
+        if matches && found.is_none() {
             found = Some(candidate);
         }
     }
@@ -230,13 +227,18 @@ pub fn check_method_scopes(
     scopes_allow(policy, method, |s| identity.scopes.contains(s))
 }
 
-#[async_trait::async_trait]
-impl Authenticator for FederationPolicy {
-    async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, A2aError> {
+impl FederationPolicy {
+    /// Work out who is calling.
+    ///
+    /// A request with an `Authorization` header must carry a valid token,
+    /// whatever `require_auth` says, and gets that token's principal. A
+    /// request without one is refused when `require_auth` is true and gets
+    /// the shared [`ANONYMOUS_PRINCIPAL`] otherwise. The layer and the
+    /// [`Authenticator`] impl both use this, so they agree.
+    pub fn principal_for(&self, headers: &HeaderMap) -> Result<Principal, A2aError> {
         if !self.require_auth && !headers.contains_key("authorization") {
             return Ok(Principal::new(ANONYMOUS_PRINCIPAL));
         }
-        // A presented token is always checked, even when auth is optional.
         let identity = validate_federation_token(headers, self)?;
         info!(
             token_name = %identity.token_name,
@@ -244,6 +246,13 @@ impl Authenticator for FederationPolicy {
             "A2A federation auth: authorized"
         );
         Ok(identity.principal())
+    }
+}
+
+#[async_trait::async_trait]
+impl Authenticator for FederationPolicy {
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, A2aError> {
+        self.principal_for(headers)
     }
 
     fn authorize(&self, principal: &Principal, method: &str) -> bool {
@@ -257,6 +266,9 @@ const AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-kno
 /// Largest JSON-RPC body the layer reads to find the method. Matches Axum's
 /// default body limit for the server's own extractor.
 const MAX_RPC_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// How long the layer waits for a request body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn invalid_request_response() -> Response {
     (
@@ -278,13 +290,16 @@ fn invalid_request_response() -> Response {
 /// router.layer(middleware::from_fn_with_state(policy, federation_auth_layer))
 /// ```
 ///
-/// When `require_auth` is true (the default) the layer:
+/// The layer:
 ///
 /// - lets `GET`/`HEAD` requests for the Agent Card through without a token
 ///   if `public_agent_card` is set (exact path match only);
-/// - rejects requests without a valid Bearer token with HTTP 401;
+/// - resolves the caller with [`FederationPolicy::principal_for`]: a token
+///   that is present must be valid (HTTP 401 otherwise); a missing token is
+///   refused when `require_auth` is true and maps to the shared anonymous
+///   principal when it is false;
 /// - reads the JSON-RPC body of `POST` requests and rejects methods the
-///   token lacks scopes for with HTTP 403, and bodies with no method with
+///   caller lacks scopes for with HTTP 403, and bodies with no method with
 ///   HTTP 400;
 /// - passes the caller's [`Principal`] to the server in the request
 ///   extensions, so tasks are bound to the caller.
@@ -305,12 +320,8 @@ pub async fn federation_auth_layer(
         return next.run(request).await;
     }
 
-    if !policy.require_auth {
-        return next.run(request).await;
-    }
-
-    let identity = match validate_federation_token(request.headers(), &policy) {
-        Ok(identity) => identity,
+    let principal = match policy.principal_for(request.headers()) {
+        Ok(principal) => principal,
         Err(e) => {
             warn!(
                 error = %e,
@@ -324,9 +335,15 @@ pub async fn federation_auth_layer(
     // The method is in the JSON-RPC body: read it (bounded), check scopes,
     // then hand the same bytes on.
     let (mut parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_RPC_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let bytes = match tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, MAX_RPC_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
 
     if parts.method == Method::POST {
@@ -339,9 +356,9 @@ pub async fn federation_auth_layer(
             warn!(path = %path, "A2A federation auth: rejected request without a method");
             return invalid_request_response();
         };
-        if !check_method_scopes(&identity, method, &policy) {
+        if !scopes_allow(&policy, method, |s| principal.scopes.contains(s)) {
             warn!(
-                token_name = %identity.token_name,
+                principal = %principal.id,
                 method = %method,
                 "A2A federation auth: missing scope"
             );
@@ -354,13 +371,7 @@ pub async fn federation_auth_layer(
         }
     }
 
-    info!(
-        token_name = %identity.token_name,
-        agent_id = ?identity.agent_id,
-        path = %path,
-        "A2A federation auth: authorized"
-    );
-    parts.extensions.insert(identity.principal());
+    parts.extensions.insert(principal);
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
 }
@@ -613,6 +624,22 @@ mod tests {
         assert!(check_method_scopes(&identity, "ListTasks", &open));
         open.method_scopes.clear();
         assert!(check_method_scopes(&identity, "CancelTask", &open));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let policy = test_policy();
+        for header in ["bearer tok-alpha", "BEARER tok-alpha", "Bearer  tok-alpha"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", HeaderValue::from_str(header).unwrap());
+            assert!(
+                validate_federation_token(&headers, &policy).is_ok(),
+                "{header}"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Basic tok-alpha"));
+        assert!(validate_federation_token(&headers, &policy).is_err());
     }
 
     #[test]

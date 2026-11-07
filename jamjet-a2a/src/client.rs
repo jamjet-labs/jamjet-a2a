@@ -115,6 +115,112 @@ impl A2aClient {
         }
     }
 
+    /// Read a response body, refusing more than `MAX_RESPONSE_BYTES`.
+    async fn read_body(
+        &self,
+        url: &str,
+        mut response: reqwest::Response,
+    ) -> Result<Vec<u8>, A2aError> {
+        let too_big = || -> A2aError {
+            A2aTransportError::InvalidResponse {
+                details: format!("response body larger than {MAX_RESPONSE_BYTES} bytes"),
+            }
+            .into()
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(too_big());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            if e.is_timeout() {
+                self.transport_error(url, e)
+            } else {
+                A2aTransportError::InvalidResponse {
+                    details: format!("failed to read response body: {e}"),
+                }
+                .into()
+            }
+        })? {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(too_big());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Send a streaming request and return its event stream.
+    ///
+    /// A server answers errors to a streaming call with a plain JSON-RPC
+    /// error (`application/json`) instead of an event stream; those are
+    /// returned as errors here, not as an empty stream.
+    async fn open_stream(
+        &self,
+        url: String,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<impl futures::Stream<Item = Result<StreamResponse, A2aError>>, A2aError> {
+        let response = self.send_for_stream(&url, builder).await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(A2aError::Auth {
+                reason: format!("HTTP {status}"),
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if content_type.starts_with("application/json") {
+            let body =
+                match tokio::time::timeout(self.request_timeout, self.read_body(&url, response))
+                    .await
+                {
+                    Ok(body) => body?,
+                    Err(_) => {
+                        return Err(A2aTransportError::Timeout {
+                            url,
+                            duration: self.request_timeout,
+                        }
+                        .into())
+                    }
+                };
+            let rpc: JsonRpcResponse<serde_json::Value> =
+                serde_json::from_slice(&body).map_err(|e| A2aTransportError::InvalidResponse {
+                    details: format!("HTTP {status}: failed to parse JSON-RPC response: {e}"),
+                })?;
+            return Err(match rpc.error {
+                Some(err) => Self::protocol_error_from_json_rpc(&err).into(),
+                None => A2aTransportError::InvalidResponse {
+                    details: "expected an event stream, got a JSON-RPC result".into(),
+                }
+                .into(),
+            });
+        }
+
+        if !status.is_success() {
+            return Err(A2aTransportError::InvalidResponse {
+                details: format!("streaming request returned HTTP {status}"),
+            }
+            .into());
+        }
+        if !content_type.starts_with("text/event-stream") {
+            return Err(A2aTransportError::InvalidResponse {
+                details: format!("expected text/event-stream, got {content_type:?}"),
+            }
+            .into());
+        }
+
+        Ok(parse_sse_stream(response, url, self.stream_idle_timeout))
+    }
+
     /// Send a streaming request, waiting at most the request timeout for the
     /// response headers.
     async fn send_for_stream(
@@ -216,19 +322,10 @@ impl A2aClient {
             });
         }
 
-        let body = response.text().await.map_err(|e| {
-            if e.is_timeout() {
-                self.transport_error(&url, e)
-            } else {
-                A2aTransportError::InvalidResponse {
-                    details: format!("failed to read response body: {e}"),
-                }
-                .into()
-            }
-        })?;
+        let body = self.read_body(&url, response).await?;
 
         let rpc_response: JsonRpcResponse<R> =
-            serde_json::from_str(&body).map_err(|e| A2aTransportError::InvalidResponse {
+            serde_json::from_slice(&body).map_err(|e| A2aTransportError::InvalidResponse {
                 details: format!("failed to parse JSON-RPC response: {e}"),
             })?;
 
@@ -279,15 +376,12 @@ impl A2aClient {
             .into());
         }
 
-        response.json::<AgentCard>().await.map_err(|e| {
-            if e.is_timeout() {
-                self.transport_error(&url, e)
-            } else {
-                A2aTransportError::InvalidResponse {
-                    details: format!("failed to parse agent card: {e}"),
-                }
-                .into()
+        let body = self.read_body(&url, response).await?;
+        serde_json::from_slice::<AgentCard>(&body).map_err(|e| {
+            A2aTransportError::InvalidResponse {
+                details: format!("failed to parse agent card: {e}"),
             }
+            .into()
         })
     }
 
@@ -327,23 +421,7 @@ impl A2aClient {
         let builder = self
             .authed_request(reqwest::Method::POST, &url)
             .json(&rpc_request);
-        let response = self.send_for_stream(&url, builder).await?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(A2aError::Auth {
-                reason: format!("HTTP {status}"),
-            });
-        }
-
-        if !status.is_success() {
-            return Err(A2aTransportError::InvalidResponse {
-                details: format!("streaming request returned HTTP {status}"),
-            }
-            .into());
-        }
-
-        Ok(parse_sse_stream(response, url, self.stream_idle_timeout))
+        self.open_stream(url, builder).await
     }
 
     /// Retrieve a task by ID.
@@ -388,23 +466,7 @@ impl A2aClient {
         let builder = self
             .authed_request(reqwest::Method::POST, &url)
             .json(&rpc_request);
-        let response = self.send_for_stream(&url, builder).await?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(A2aError::Auth {
-                reason: format!("HTTP {status}"),
-            });
-        }
-
-        if !status.is_success() {
-            return Err(A2aTransportError::InvalidResponse {
-                details: format!("subscribe request returned HTTP {status}"),
-            }
-            .into());
-        }
-
-        Ok(parse_sse_stream(response, url, self.stream_idle_timeout))
+        self.open_stream(url, builder).await
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -533,13 +595,53 @@ impl Default for A2aClient {
 /// stream, so a server cannot grow client memory without bound.
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Largest unary response body the client reads.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Turn the `data` of one SSE event into a [`StreamResponse`].
+///
+/// Accepts a bare StreamResponse (what this crate's server sends) and the
+/// A2A v1.0 JSON-RPC form, `{"jsonrpc":"2.0","result":...}`, with the result
+/// either bare or wrapped as `{"task":...}`, `{"statusUpdate":...}` and so
+/// on. A JSON-RPC error event becomes the matching protocol error.
+fn parse_sse_data(data: &str) -> Result<StreamResponse, A2aError> {
+    let invalid =
+        |details: String| -> A2aError { A2aTransportError::InvalidResponse { details }.into() };
+    let value: serde_json::Value =
+        serde_json::from_str(data).map_err(|e| invalid(format!("SSE parse error: {e}")))?;
+    let value = if value.get("jsonrpc").is_some() {
+        let rpc: JsonRpcResponse<serde_json::Value> =
+            serde_json::from_value(value).map_err(|e| invalid(format!("SSE parse error: {e}")))?;
+        if let Some(err) = rpc.error {
+            return Err(A2aClient::protocol_error_from_json_rpc(&err).into());
+        }
+        let result = rpc
+            .result
+            .ok_or_else(|| invalid("SSE event has neither result nor error".into()))?;
+        match result.as_object() {
+            Some(obj) if obj.len() == 1 => {
+                let (key, inner) = obj.iter().next().expect("one entry");
+                match key.as_str() {
+                    "task" | "message" | "statusUpdate" | "artifactUpdate" => inner.clone(),
+                    _ => result,
+                }
+            }
+            _ => result,
+        }
+    } else {
+        value
+    };
+    serde_json::from_value(value).map_err(|e| invalid(format!("SSE parse error: {e}")))
+}
+
 /// Parse an SSE byte stream into a stream of [`StreamResponse`] events.
 ///
-/// TCP chunks are NOT aligned to SSE event boundaries, so we buffer bytes
-/// across chunks and split on the `\n\n` delimiter before decoding. The
-/// stream ends with [`A2aTransportError::Timeout`] if no bytes arrive for
-/// `idle_timeout`, and with an error if one event grows past
-/// `MAX_SSE_EVENT_BYTES`.
+/// Follows the SSE line format: lines end in LF, CRLF or CR; `data` lines
+/// (with or without a space after the colon) are joined with newlines; a
+/// blank line ends an event; comments and other fields are ignored. Each
+/// byte is scanned once. The stream ends with an error if no bytes arrive
+/// for `idle_timeout`, if one event grows past `MAX_SSE_EVENT_BYTES`, or if
+/// the body ends in the middle of an event.
 fn parse_sse_stream(
     response: reqwest::Response,
     url: String,
@@ -550,46 +652,71 @@ fn parse_sse_stream(
 
     struct SseState<S> {
         body: S,
-        buf: Vec<u8>,
-        /// Bytes of `buf` already searched for a delimiter.
-        scanned: usize,
+        /// Bytes of the current, unfinished line.
+        line: Vec<u8>,
+        /// The last byte seen was CR, so a following LF belongs to it.
+        after_cr: bool,
+        /// `data` of the current event so far.
+        data: String,
+        has_data: bool,
         pending: VecDeque<Result<StreamResponse, A2aError>>,
         done: bool,
         url: String,
         idle_timeout: Duration,
     }
 
-    fn drain_events<S>(st: &mut SseState<S>) {
-        loop {
-            // Resume the search one byte back, in case a chunk ended between
-            // the two newlines.
-            let from = st.scanned.saturating_sub(1);
-            let Some(rel) = st.buf[from..].windows(2).position(|w| w == b"\n\n") else {
-                st.scanned = st.buf.len();
-                return;
-            };
-            let pos = from + rel;
-            let block: Vec<u8> = st.buf.drain(..pos + 2).collect();
-            st.scanned = 0;
-            let text = String::from_utf8_lossy(&block[..pos]);
-            for line in text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    st.pending
-                        .push_back(serde_json::from_str::<StreamResponse>(data).map_err(|e| {
-                            A2aTransportError::InvalidResponse {
-                                details: format!("SSE parse error: {e}"),
-                            }
-                            .into()
-                        }));
+    fn end_line<S>(st: &mut SseState<S>) {
+        let line = String::from_utf8_lossy(&st.line).into_owned();
+        st.line.clear();
+        if line.is_empty() {
+            if st.has_data {
+                let data = std::mem::take(&mut st.data);
+                st.has_data = false;
+                st.pending.push_back(parse_sse_data(&data));
+            }
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line.as_str(), ""),
+        };
+        if field == "data" {
+            if st.has_data {
+                st.data.push('\n');
+            }
+            st.data.push_str(value);
+            st.has_data = true;
+        }
+    }
+
+    fn feed<S>(st: &mut SseState<S>, chunk: &[u8]) {
+        for &b in chunk {
+            if st.after_cr {
+                st.after_cr = false;
+                if b == b'\n' {
+                    continue;
                 }
+            }
+            match b {
+                b'\n' => end_line(st),
+                b'\r' => {
+                    end_line(st);
+                    st.after_cr = true;
+                }
+                _ => st.line.push(b),
             }
         }
     }
 
     let init = SseState {
         body: response.bytes_stream().boxed(),
-        buf: Vec::new(),
-        scanned: 0,
+        line: Vec::new(),
+        after_cr: false,
+        data: String::new(),
+        has_data: false,
         pending: VecDeque::new(),
         done: false,
         url,
@@ -613,7 +740,17 @@ fn parse_sse_stream(
                     }
                     .into()));
                 }
-                Ok(None) => st.done = true,
+                Ok(None) => {
+                    st.done = true;
+                    let partial = !st.line.iter().all(u8::is_ascii_whitespace);
+                    if st.has_data || partial {
+                        st.pending
+                            .push_back(Err(A2aTransportError::InvalidResponse {
+                                details: "stream ended in the middle of an event".into(),
+                            }
+                            .into()));
+                    }
+                }
                 Ok(Some(Err(e))) => {
                     st.done = true;
                     st.pending.push_back(Err(A2aTransportError::SseError {
@@ -622,9 +759,8 @@ fn parse_sse_stream(
                     .into()));
                 }
                 Ok(Some(Ok(chunk))) => {
-                    st.buf.extend_from_slice(&chunk);
-                    drain_events(&mut st);
-                    if st.buf.len() > MAX_SSE_EVENT_BYTES {
+                    feed(&mut st, &chunk);
+                    if st.line.len() + st.data.len() > MAX_SSE_EVENT_BYTES {
                         st.done = true;
                         st.pending
                             .push_back(Err(A2aTransportError::InvalidResponse {
